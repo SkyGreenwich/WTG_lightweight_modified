@@ -1113,8 +1113,7 @@ function estimateDynamicMinutes(turnText, charCount = 0, similarity = 0.5) {
 
   // Only when "some time passed" explicitly appears, allow more noticeable time progression.
   const longPassagePattern =
-    /\b(after a while|some time later|later that|later the|eventually|by dawn|by noon|by dusk|by evening|by midnight|the next morning|the next day|the next night|hours passed|minutes passed|time passed|as the day wore on)\b/;
-
+    /\b(later|afterward|afterwards|eventually|overnight|tomorrow|hourly|nightfall|daybreak|then)\b|after that/;
   // Moving, waiting, resting, etc., progress faster than normal actions but still limited to small minute ranges.
   const transitionPattern =
     /\b(travel|journey|trek|hike|march|ride|sail|fly|drive|wait|rest|camp|cross|return|leave|arrive|reach|continue|proceed)\b/;

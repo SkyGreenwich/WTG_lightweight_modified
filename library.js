@@ -121,7 +121,7 @@ function getSleepDuration(currentTime) {
   }
 
   if (!config || !config.sleepRange) {
-    return {days: 1, hours: 8, minutes: 0, wakeMessage: 'the next day'};
+    return {days: 1, hours: 8, minutes: 0};
   }
 
   const minHours = config.sleepRange.hours[0];
@@ -132,7 +132,6 @@ function getSleepDuration(currentTime) {
   return {
     hours,
     minutes,
-    wakeMessage: config.sleepRange.crossesDay ? 'the next day' : 'later that day'
   };
 }
 
@@ -1404,7 +1403,7 @@ function onInput_WTG(text) {
       state.currentDate = currentDate;
       state.currentTime = currentTime;
       const ttMarker = formatTurnTime(state.turnTime);
-      messages.push(`\n\n[SYSTEM] You go to sleep and wake up ${add.wakeMessage} on ${state.currentDate} at ${state.currentTime}. [[${ttMarker}]]\n\n`);
+      messages.push(`\n\n[SYSTEM] You go to sleep and wake up on ${state.currentDate} at ${state.currentTime}. [[${ttMarker}]]\n\n`);
     } else {
       // If the current clock is unknown, preserve the fixed scene start and only advance the day count.
       state.turnTime = addToTurnTime(state.turnTime, {days: 1});
@@ -1412,7 +1411,7 @@ function onInput_WTG(text) {
       state.currentDate = currentDate;
       state.currentTime = currentTime;
       const ttMarker = formatTurnTime(state.turnTime);
-      messages.push(`\n\n[SYSTEM] You go to sleep and wake up the next day on ${state.currentDate} at ${state.currentTime}. [[${ttMarker}]]\n\n`);
+      messages.push(`\n\n[SYSTEM] You go to sleep and wake up on ${state.currentDate} at ${state.currentTime}. [[${ttMarker}]]\n\n`);
     }
     state.insertMarker = true;
     state.changed = true;

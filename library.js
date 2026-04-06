@@ -91,6 +91,78 @@ function randomIntInclusive(min, max) {
 }
 
 /**
+ * Parses an advance specification into supported time units.
+ * Supports single-number legacy input ("30" => 30 hours), spaced pairs
+ * ("1 month 2 days"), and compact pairs ("1month 2days 3hours").
+ * @param {string} spec - Raw advance arguments
+ * @returns {Object} Parsed result with add/summary or an error message
+ */
+function parseAdvanceSpec(spec) {
+  const rawSpec = (spec || '').trim();
+  if (!rawSpec) {
+    return {error: '[Invalid advance amount. Use a positive integer.]'};
+  }
+
+  if (/^\d+$/.test(rawSpec)) {
+    const hours = parseInt(rawSpec, 10);
+    return {
+      add: {hours},
+      summary: `${hours} hour${hours === 1 ? '' : 's'}`
+    };
+  }
+
+  const add = {years: 0, months: 0, days: 0, hours: 0, minutes: 0};
+  const summaryParts = [];
+  const tokenRegex = /(\d+)\s*(minute|minutes|hour|hours|day|days|month|months|year|years)\b/gi;
+  let lastIndex = 0;
+  let matched = false;
+  let match;
+
+  while ((match = tokenRegex.exec(rawSpec)) !== null) {
+    const between = rawSpec.slice(lastIndex, match.index).trim();
+    if (between) {
+      return {error: '[Invalid advance unit. Supported units: minutes, hours, days, months, years.]'};
+    }
+
+    matched = true;
+    const amount = parseInt(match[1], 10);
+    const unit = match[2].toLowerCase();
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return {error: '[Invalid advance amount. Use a positive integer.]'};
+    }
+
+    if (unit === 'minute' || unit === 'minutes') {
+      add.minutes += amount;
+      summaryParts.push(`${amount} minute${amount === 1 ? '' : 's'}`);
+    } else if (unit === 'hour' || unit === 'hours') {
+      add.hours += amount;
+      summaryParts.push(`${amount} hour${amount === 1 ? '' : 's'}`);
+    } else if (unit === 'day' || unit === 'days') {
+      add.days += amount;
+      summaryParts.push(`${amount} day${amount === 1 ? '' : 's'}`);
+    } else if (unit === 'month' || unit === 'months') {
+      add.months += amount;
+      summaryParts.push(`${amount} month${amount === 1 ? '' : 's'}`);
+    } else if (unit === 'year' || unit === 'years') {
+      add.years += amount;
+      summaryParts.push(`${amount} year${amount === 1 ? '' : 's'}`);
+    }
+
+    lastIndex = tokenRegex.lastIndex;
+  }
+
+  if (!matched || rawSpec.slice(lastIndex).trim()) {
+    return {error: '[Invalid advance unit. Supported units: minutes, hours, days, months, years.]'};
+  }
+
+  return {
+    add,
+    summary: summaryParts.join(' ')
+  };
+}
+
+/**
  * Maps a precise clock to the closest existing descriptive bucket
  * @param {string} timeStr - Precise time string
  * @returns {string} Descriptive bucket key
@@ -868,7 +940,7 @@ function getCurrentDateTimeCard() {
     dateTimeCard = storyCards[storyCards.length - 1];
     dateTimeCard.type = "event";
     dateTimeCard.keys = "date,time,current date,current time,clock,hour,am,pm";
-    dateTimeCard.description = "Commands:\n[settime mm/dd/yyyy time] - Set starting date and time\n[advance N [hours|days|months|years]] - Advance time/date\n[sleep] - Sleep and advance time based on the current clock\n[reset] - Reset to most recent mention in history";
+    dateTimeCard.description = "Commands:\n[settime mm/dd/yyyy time] - Set starting date and time\n[advance N [minutes|hours|days|months|years] or combos like 1month 2days] - Advance time/date\n[sleep] - Sleep and advance time based on the current clock\n[reset] - Reset to most recent mention in history";
   }
   return dateTimeCard;
 }
@@ -1469,30 +1541,18 @@ function onInput_WTG(text) {
         if (state.startingTime === 'Unknown') {
           messages.push(`[Time advancement not applied as current time is descriptive (${state.startingTime}). Use [settime] to set a numeric time if needed.]`);
         } else {
-          const amount = parseInt(parts[1], 10);
-          const unit = parts[2] ? parts[2].toLowerCase() : 'hours';
-          if (!Number.isFinite(amount) || amount <= 0) {
-            messages.push('[Invalid advance amount. Use a positive integer.]');
+          const parsedAdvance = parseAdvanceSpec(parts.slice(1).join(' '));
+          if (parsedAdvance.error) {
+            messages.push(parsedAdvance.error);
           } else {
-            let add = {};
-            if (unit.startsWith('y')) {
-              add.years = amount;
-            } else if (unit.startsWith('m')) {
-              add.months = amount;
-            } else if (unit.startsWith('d')) {
-              add.days = amount;
-            } else if (unit.startsWith('h')) {
-              add.hours = amount;
-            } else {
-              messages.push('[Invalid advance unit. Supported units: hours, days, months, years.]');
-            }
-            if (add.years || add.months || add.days || add.hours) {
+            const add = parsedAdvance.add;
+            if (add.years || add.months || add.days || add.hours || add.minutes) {
               state.turnTime = addToTurnTime(state.turnTime, add);
               const {currentDate, currentTime} = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
               state.currentDate = currentDate;
               state.currentTime = currentTime;
               const ttMarker = formatTurnTime(state.turnTime);
-              messages.push(`\n\n[SYSTEM] Advanced ${amount} ${unit}. New date/time: ${state.currentDate} ${state.currentTime}. [[${ttMarker}]]\n\n`);
+              messages.push(`\n\n[SYSTEM] Advanced ${parsedAdvance.summary}. New date/time: ${state.currentDate} ${state.currentTime}. [[${ttMarker}]]\n\n`);
               state.insertMarker = true;
               state.changed = true;
               setAdvanceCooldown({minutes: 5});

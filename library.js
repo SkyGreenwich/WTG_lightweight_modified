@@ -11,15 +11,15 @@ const WTG_SCENE_FIXED_START_TIME = '8:00 PM'; // Or change it as needed
 
 // Mapping table for descriptive time expressions
 const descriptiveMap = new Map([
-  ['morning', '8:00 AM'],
-  ['afternoon', '2:00 PM'],
-  ['noon', '12:00 PM'],
-  ['evening', '6:00 PM'],
-  ['night', '10:00 PM'],
-  ['dawn', '6:00 AM'],
-  ['dusk', '8:00 PM'],
-  ['midday', '12:00 PM'],
-  ['midnight', '12:00 AM']
+  ['morning', {defaultTime: '8:00 AM', sleepRange: {hours: [1, 4], crossesDay: false}}],
+  ['afternoon', {defaultTime: '2:00 PM', sleepRange: {hours: [1, 3], crossesDay: false}}],
+  ['noon', {defaultTime: '12:00 PM', sleepRange: {hours: [1, 2], crossesDay: false}}],
+  ['evening', {defaultTime: '6:00 PM', sleepRange: {hours: [3, 6], crossesDay: false}}],
+  ['night', {defaultTime: '10:00 PM', sleepRange: {hours: [6, 9], crossesDay: true}}],
+  ['dawn', {defaultTime: '6:00 AM', sleepRange: {hours: [1, 3], crossesDay: false}}],
+  ['dusk', {defaultTime: '8:00 PM', sleepRange: {hours: [4, 8], crossesDay: true}}],
+  ['midday', {defaultTime: '12:00 PM', sleepRange: {hours: [1, 2], crossesDay: false}}],
+  ['midnight', {defaultTime: '12:00 AM', sleepRange: {hours: [6, 8], crossesDay: true}}]
 ]);
 
 /**
@@ -56,9 +56,84 @@ function normalizeTime(str) {
   if (!str) return null;
   const lower = str.toLowerCase();
   if (descriptiveMap.has(lower)) {
-    return descriptiveMap.get(lower);
+    return descriptiveMap.get(lower).defaultTime;
   }
   return capitalize(str);
+}
+
+/**
+ * Returns descriptive time metadata if the value is one of the configured labels
+ * @param {string} str - Time string or descriptive label
+ * @returns {Object|null} Descriptive time configuration
+ */
+function getDescriptiveTimeConfig(str) {
+  if (!str) return null;
+  return descriptiveMap.get(str.toLowerCase()) || null;
+}
+
+/**
+ * Checks whether a time string is a precise numeric clock
+ * @param {string} timeStr - Time string to check
+ * @returns {boolean} True if the string is a numeric clock
+ */
+function isPreciseTime(timeStr) {
+  return Boolean(timeStr && /\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M/i.test(timeStr));
+}
+
+/**
+ * Returns a random integer within the inclusive range
+ * @param {number} min - Lower bound
+ * @param {number} max - Upper bound
+ * @returns {number} Random integer
+ */
+function randomIntInclusive(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/**
+ * Maps a precise clock to the closest existing descriptive bucket
+ * @param {string} timeStr - Precise time string
+ * @returns {string} Descriptive bucket key
+ */
+function getDescriptiveBucketFromPreciseTime(timeStr) {
+  const {hour, min} = parseTime(timeStr);
+  const totalMinutes = hour * 60 + min;
+  if (totalMinutes >= 0 && totalMinutes < 300) return 'midnight';
+  if (totalMinutes >= 300 && totalMinutes < 480) return 'dawn';
+  if (totalMinutes >= 480 && totalMinutes < 720) return 'morning';
+  if (totalMinutes >= 720 && totalMinutes < 1020) return 'afternoon';
+  if (totalMinutes >= 1020 && totalMinutes < 1200) return 'evening';
+  return 'night';
+}
+
+/**
+ * Chooses a sleep duration while preserving the original turn-time model
+ * @param {string} currentTime - Current time string
+ * @returns {Object} Duration compatible with addToTurnTime
+ */
+function getSleepDuration(currentTime) {
+  let config = null;
+
+  if (isPreciseTime(currentTime)) {
+    config = getDescriptiveTimeConfig(getDescriptiveBucketFromPreciseTime(currentTime));
+  } else {
+    config = getDescriptiveTimeConfig(currentTime);
+  }
+
+  if (!config || !config.sleepRange) {
+    return {days: 1, hours: 8, minutes: 0, wakeMessage: 'the next day'};
+  }
+
+  const minHours = config.sleepRange.hours[0];
+  const maxHours = config.sleepRange.hours[1];
+  const hours = randomIntInclusive(minHours, maxHours);
+  const minutes = randomIntInclusive(0, 59);
+
+  return {
+    hours,
+    minutes,
+    wakeMessage: config.sleepRange.crossesDay ? 'the next day' : 'later that day'
+  };
 }
 
 /**
@@ -794,7 +869,7 @@ function getCurrentDateTimeCard() {
     dateTimeCard = storyCards[storyCards.length - 1];
     dateTimeCard.type = "event";
     dateTimeCard.keys = "date,time,current date,current time,clock,hour,am,pm";
-    dateTimeCard.description = "Commands:\n[settime mm/dd/yyyy time] - Set starting date and time\n[advance N [hours|days|months|years]] - Advance time/date\n[sleep] - Sleep to next morning\n[reset] - Reset to most recent mention in history";
+    dateTimeCard.description = "Commands:\n[settime mm/dd/yyyy time] - Set starting date and time\n[advance N [hours|days|months|years]] - Advance time/date\n[sleep] - Sleep and advance time based on the current clock\n[reset] - Reset to most recent mention in history";
   }
   return dateTimeCard;
 }
@@ -1321,30 +1396,23 @@ function onInput_WTG(text) {
 
   // Prioritize handling the dedicated [sleep] command as it completely replaces this input.
   if (text.trim().toLowerCase() === '[sleep]') {
-    if (state.currentTime !== 'Unknown' && /\d/.test(state.currentTime)) {
-      // When current time is numeric, sleep advances randomly by 6-8 hours plus random minutes,
-      // preserving the original lightweight style.
-      let sleepHours = Math.floor(Math.random() * 3) + 6;
-      let sleepMinutes = Math.floor(Math.random() * 60);
-      let add = {hours: sleepHours, minutes: sleepMinutes};
+    if (state.currentTime !== 'Unknown') {
+      // Sleep should advance the current clock without mutating the fixed scene starting time.
+      let add = getSleepDuration(state.currentTime);
       state.turnTime = addToTurnTime(state.turnTime, add);
       const {currentDate, currentTime} = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
       state.currentDate = currentDate;
       state.currentTime = currentTime;
-      let wakeMessage = (add.days > 0 || state.turnTime.days > 0) ? "the next day" : "later that day";
       const ttMarker = formatTurnTime(state.turnTime);
-      messages.push(`\n\n[SYSTEM] You go to sleep and wake up ${wakeMessage} on ${state.currentDate} at ${state.currentTime}. [[${ttMarker}]]\n\n`);
+      messages.push(`\n\n[SYSTEM] You go to sleep and wake up ${add.wakeMessage} on ${state.currentDate} at ${state.currentTime}. [[${ttMarker}]]\n\n`);
     } else {
-      // Legacy fallback: if current time is still descriptive/unknown,
-      // anchor wake time to next morning 8:00 AM.
-      state.turnTime = {years:0, months:0, days:0, hours:0, minutes:0, seconds:0};
+      // If the current clock is unknown, preserve the fixed scene start and only advance the day count.
       state.turnTime = addToTurnTime(state.turnTime, {days: 1});
-      state.startingTime = "8:00 AM";
       const {currentDate, currentTime} = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
       state.currentDate = currentDate;
       state.currentTime = currentTime;
       const ttMarker = formatTurnTime(state.turnTime);
-      messages.push(`\n\n[SYSTEM] You go to sleep and wake up the next morning on ${state.currentDate} at ${state.currentTime}. [[${ttMarker}]]\n\n`);
+      messages.push(`\n\n[SYSTEM] You go to sleep and wake up the next day on ${state.currentDate} at ${state.currentTime}. [[${ttMarker}]]\n\n`);
     }
     state.insertMarker = true;
     state.changed = true;

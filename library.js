@@ -907,8 +907,9 @@ function updateAllStoryCardTimestamps(newDate, newTime) {
         // Replace placeholder timestamp with new timestamp
         card.entry = card.entry.replace(/(Discovered on|Met on|Visited) \d{1,2}\/\d{1,2}\/\d{4}\s+Unknown/, `$1 ${timestamp}`);
       } else if (card.entry.includes(WTG_SCENE_START_DATE)) {
-        // Replace default date timestamp with new timestamp
-        card.entry = card.entry.replace(/(Discovered on|Met on|Visited) 11\/13\/2009\s+[\d:]+ [AP]M/, `$1 ${timestamp}`);
+        // Replace default configured placeholder timestamp with new timestamp
+        const placeholderRegex = new RegExp(`(Discovered on|Met on|Visited) ${WTG_SCENE_START_DATE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+[\\d:]+ [AP]M`);
+        card.entry = card.entry.replace(placeholderRegex, `$1 ${timestamp}`);
       }
     }
   }

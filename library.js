@@ -609,6 +609,40 @@ function getLatestPlayerAction(historyItems) {
 }
 
 /**
+ * Normalizes player action text for stable identity comparison across retry/erase flows.
+ * @param {string} text - Raw action text
+ * @returns {string} Normalized action text
+ */
+function normalizeActionText(text) {
+  return String(text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Checks whether two player actions should be treated as the same action for timing purposes.
+ * @param {string} typeA - First action type
+ * @param {string} textA - First action text
+ * @param {string} typeB - Second action type
+ * @param {string} textB - Second action text
+ * @returns {boolean} True if the actions are equivalent
+ */
+function isSameAction(typeA, textA, typeB, textB) {
+  return typeA === typeB && normalizeActionText(textA) === normalizeActionText(textB);
+}
+
+/**
+ * Builds a stable action signature for retry/erase identity checks.
+ * @param {string} type - Action type
+ * @param {string} text - Action text
+ * @returns {string} Stable signature
+ */
+function getActionSignature(type, text) {
+  return `${type || ''}:${normalizeActionText(text)}`;
+}
+
+/**
  * Records the most recent player action that WTG has accepted and written to the timeline.
  * This state is used to distinguish "genuinely new actions" from "retry regeneration of the same action".
  * @param {Object|null} action - Most recent player action
@@ -617,7 +651,69 @@ function rememberProcessedAction(action) {
   if (!action) return;
   state.wtgLastProcessedActionCount = info.actionCount;
   state.wtgLastProcessedActionType = action.type;
-  state.wtgLastProcessedActionText = action.text;
+  state.wtgLastProcessedActionText = normalizeActionText(action.text);
+  state.wtgLastProcessedActionSignature = getActionSignature(action.type, action.text);
+}
+
+/**
+ * Tracks the newest player-authored input before history catches up.
+ * This is the authoritative source for whether the current cycle represents a new player action.
+ * @param {string} text - Raw player input text
+ */
+function rememberPendingPlayerInput(text) {
+  const normalizedText = normalizeActionText(text);
+  if (!normalizedText) return;
+  state.wtgPendingPlayerInputText = normalizedText;
+  state.wtgPendingPlayerInputRaw = String(text || '');
+  state.wtgPendingPlayerInputCount = info.actionCount;
+  state.wtgPendingPlayerInputNeedsTiming = true;
+}
+
+/**
+ * Clears the pending player input marker after the cycle has been consumed.
+ */
+function clearPendingPlayerInput() {
+  delete state.wtgPendingPlayerInputText;
+  delete state.wtgPendingPlayerInputRaw;
+  delete state.wtgPendingPlayerInputCount;
+  delete state.wtgPendingPlayerInputNeedsTiming;
+}
+
+/**
+ * Checks whether a fresh player input is currently pending processing.
+ * @returns {boolean} True if the current cycle originated from a new player input
+ */
+function hasPendingPlayerInput() {
+  return Boolean(state.wtgPendingPlayerInputText);
+}
+
+/**
+ * Checks whether a pending player input still needs automatic timing for this cycle.
+ * @returns {boolean} True if automatic timing has not yet been consumed
+ */
+function hasFreshPendingPlayerInput() {
+  return Boolean(state.wtgPendingPlayerInputText && state.wtgPendingPlayerInputNeedsTiming);
+}
+
+/**
+ * Returns the current action that should drive automatic timing.
+ * Prefer the pending player input captured in onInput_WTG, and only fall back to history
+ * when it matches that pending input or when no pending input exists.
+ * @param {Array} historyItems - History array
+ * @returns {Object|null} Timing action object
+ */
+function getTimingAction(historyItems) {
+  const latestAction = getLatestPlayerAction(historyItems);
+  if (hasPendingPlayerInput()) {
+    if (latestAction && normalizeActionText(latestAction.text) === state.wtgPendingPlayerInputText) {
+      return latestAction;
+    }
+    return {
+      type: latestAction ? latestAction.type : 'do',
+      text: state.wtgPendingPlayerInputRaw || state.wtgPendingPlayerInputText
+    };
+  }
+  return latestAction;
 }
 
 /**
@@ -658,19 +754,72 @@ function isResponseStillPresentInHistory(historyItems, responseText) {
  * @returns {boolean} True if judged as retry
  */
 function isRetryGeneration(historyItems, turnData) {
+  if (hasPendingPlayerInput()) return false;
   const latestAction = getLatestPlayerAction(historyItems);
   const latestTurnData = getLatestTurnDataEntry(turnData);
   if (!latestAction || !latestTurnData) return false;
 
-  const sameProcessedAction =
-    state.wtgLastProcessedActionType === latestAction.type &&
-    state.wtgLastProcessedActionText === latestAction.text;
-  const sameTurnDataAction =
-    latestTurnData.actionType === latestAction.type &&
-    latestTurnData.actionText === latestAction.text;
+  const sameProcessedAction = isSameAction(
+    state.wtgLastProcessedActionType,
+    state.wtgLastProcessedActionText,
+    latestAction.type,
+    latestAction.text
+  );
+  const sameTurnDataAction = isSameAction(
+    latestTurnData.actionType,
+    latestTurnData.actionText,
+    latestAction.type,
+    latestAction.text
+  );
+  const sameProcessedActionCount = state.wtgLastProcessedActionCount === info.actionCount;
   const previousResponseStillPresent = isResponseStillPresentInHistory(historyItems, latestTurnData.responseText);
 
-  return Boolean(sameProcessedAction && sameTurnDataAction && !previousResponseStillPresent);
+  return Boolean(sameProcessedAction && sameProcessedActionCount && sameTurnDataAction && !previousResponseStillPresent);
+}
+
+/**
+ * Finds the newest persisted turn entry that matches the specified player action.
+ * @param {Object|null} action - Most recent player action
+ * @param {Array} turnData - Array returned by getTurnData()
+ * @returns {Object|null} Matching persisted turn entry; null if none exists
+ */
+function findMatchingTurnDataEntry(action, turnData) {
+  if (!action || !turnData || turnData.length === 0) return null;
+  for (let i = turnData.length - 1; i >= 0; i--) {
+    const entry = turnData[i];
+    if (isSameAction(entry.actionType, entry.actionText, action.type, action.text)) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+/**
+ * Checks whether the latest persisted turn already corresponds to the same player action.
+ * @param {Object|null} action - Most recent player action
+ * @param {Array} turnData - Array returned by getTurnData()
+ * @returns {boolean} True if the latest persisted turn already matches the action
+ */
+function isActionAlreadyTimed(action, turnData) {
+  if (!action || !turnData || turnData.length === 0) return false;
+  const latestTurnData = getLatestTurnDataEntry(turnData);
+  return Boolean(latestTurnData && isSameAction(latestTurnData.actionType, latestTurnData.actionText, action.type, action.text));
+}
+
+/**
+ * Checks whether the current generation is reusing the same player action without a new submission.
+ * This acts as the primary retry/erase+continue guard for time advancement.
+ * @param {Object|null} action - Most recent player action
+ * @returns {boolean} True if this should be treated as a retry-like regeneration
+ */
+function isRetryLikeAction(action) {
+  if (hasPendingPlayerInput() || !action) return false;
+
+  const currentSignature = getActionSignature(action.type, action.text);
+  const sameProcessedAction = state.wtgLastProcessedActionSignature === currentSignature;
+  const sameActionCount = state.wtgLastProcessedActionCount === info.actionCount;
+
+  return Boolean(sameProcessedAction && sameActionCount);
 }
 
 /**
@@ -695,7 +844,7 @@ function upsertLatestTurnData(actionType, actionText, responseText, timestamp) {
   const lastMatch = matches[matches.length - 1];
   const lastActionType = lastMatch[1];
   const lastActionText = lastMatch[2];
-  if (lastActionType !== actionType || lastActionText !== actionText) {
+  if (!isSameAction(lastActionType, lastActionText, actionType, actionText)) {
     addTurnData(actionType, actionText, responseText, timestamp);
     return;
   }
@@ -1247,74 +1396,181 @@ function getTimeMultiplier() {
 }
 
 /**
- * Estimates the number of minutes that should naturally elapse for a normal turn.
- * This only handles "automatic flow rate" and does not trigger any explicit time-skip commands;
- * [sleep] / [advance] can still only be entered manually by the player.
- * @param {string} turnText - Current turn text
- * @param {number} charCount - Character count of current turn text
- * @param {number} similarity - Similarity to previous turn (0~1)
+ * Estimates automatic elapsed minutes from the newest player action itself.
+ * The model uses weighted semantic cues plus a deterministic tie-breaker so actions
+ * with similar wording stay stable, while keywords do not directly hardcode fixed minutes.
+ * @param {string} turnText - Latest player action text
+ * @param {string} actionType - Player action type
+ * @param {number} similarity - Similarity to recent turns (0~1)
  * @returns {number} Estimated number of minutes
  */
-function estimateDynamicMinutes(turnText, charCount = 0, similarity = 0.5) {
-  const lower = (turnText || '').toLowerCase();
+function estimateDynamicMinutes(turnText, actionType = 'do', similarity = 0.5) {
+  const normalizedText = normalizeActionText(turnText);
+  const lower = normalizedText.toLowerCase();
+  const charCount = normalizedText.length;
 
-  // Only when "some time passed" explicitly appears, allow more noticeable time progression.
-  const longPassagePattern =
-    /\b(later|afterward|afterwards|eventually|overnight|tomorrow|hourly|nightfall|daybreak|then)\b|after that/;
-  // Moving, waiting, resting, etc., progress faster than normal actions but still limited to small minute ranges.
-  const transitionPattern =
-    /\b(travel|journey|trek|hike|march|ride|sail|fly|drive|wait|rest|camp|cross|return|leave|arrive|reach|continue|proceed)\b/;
+  if (!normalizedText) return 0;
 
-  // Searching, investigating, exploring, handling objects, etc., typically fall between dialogue and explicit passage of time.
+  const explicitPassagePattern =
+    /\b(later|afterward|afterwards|eventually|overnight|tomorrow|hourly|nightfall|daybreak|meanwhile)\b|after that/gi;
+  const travelPattern =
+    /\b(travel|journey|trek|hike|march|ride|sail|fly|drive|cross|return|leave|arrive|reach|head|move|proceed)\b/gi;
   const explorationPattern =
-    /\b(search|explore|inspect|investigate|track|follow|climb|descend|enter|open|unlock|gather|cook|tend|examine|study|scout)\b/;
+    /\b(search|explore|inspect|investigate|track|follow|climb|descend|enter|open|unlock|gather|cook|tend|examine|study|scout|prepare|work|build|repair)\b/gi;
+  const pausePattern =
+    /\b(wait|rest|pause|linger|watch|listen)\b/gi;
+  const combatPattern =
+    /\b(attack|fight|block|parry|dodge|slash|stab|shoot|strike|lunge|grapple|wrestle)\b/gi;
+  const socialPattern =
+    /\b(say|ask|talk|whisper|reply|speak|chat|converse|laugh|cry|smile|frown|sigh|gasp|grin|smirk|nod|shrug|gesture|blink|hesitate|glance|look|notice|realize)\b/gi;
 
-  // Combat and short intense actions should not automatically advance many minutes.
+  const countMatches = (pattern) => {
+    const matches = lower.match(pattern);
+    return matches ? matches.length : 0;
+  };
+
+  const explicitPassageHits = countMatches(explicitPassagePattern);
+  const travelHits = countMatches(travelPattern);
+  const explorationHits = countMatches(explorationPattern);
+  const pauseHits = countMatches(pausePattern);
+  const combatHits = countMatches(combatPattern);
+  const socialHits = countMatches(socialPattern);
+
+  let score = 0;
+
+  if (actionType === 'story') {
+    score += 0.18;
+  } else if (actionType === 'say') {
+    score -= 0.18;
+  }
+
+  score += Math.min(3.2, explicitPassageHits * 1.55);
+  score += Math.min(1.8, travelHits * 0.7);
+  score += Math.min(1.4, explorationHits * 0.48);
+  score += Math.min(0.9, pauseHits * 0.35);
+  score -= Math.min(1.0, combatHits * 0.3);
+  score -= Math.min(0.9, socialHits * 0.22);
+
+  if (charCount >= 380) {
+    score += 0.45;
+  } else if (charCount >= 180) {
+    score += 0.22;
+  } else if (charCount <= 45) {
+    score -= 0.18;
+  }
+
+  if (similarity >= 0.82) {
+    score -= 0.35;
+  } else if (similarity >= 0.65) {
+    score -= 0.18;
+  } else if (similarity <= 0.15) {
+    score += 0.14;
+  }
+
+  if (socialHits > 0 && explicitPassageHits === 0 && travelHits === 0 && explorationHits === 0 && pauseHits === 0) {
+    score = Math.min(score, 0.85);
+  }
+
+  if (combatHits > 0 && explicitPassageHits === 0 && travelHits === 0 && explorationHits === 0) {
+    score = Math.min(score, 1.0);
+  }
+
+  if (explicitPassageHits === 0 && travelHits === 0 && explorationHits === 0 && pauseHits === 0 && socialHits === 0 && combatHits === 0) {
+    score = Math.min(score, 0.35);
+  }
+
+  let hash = 0;
+  for (let i = 0; i < normalizedText.length; i++) {
+    hash = (hash * 31 + normalizedText.charCodeAt(i)) % 1000003;
+  }
+  const jitter = ((hash % 17) - 8) / 100;
+  const adjustedScore = Math.max(0, score + jitter);
+
+  if (adjustedScore < 0.45) return 0;
+  if (adjustedScore < 1.2) return 1;
+  if (adjustedScore < 2.35) return 2;
+  if (explicitPassageHits === 0) return 3;
+  if (adjustedScore < 3.8) return 3;
+  if (adjustedScore < 4.8) return 4;
+  return 5;
+}
+
+/**
+ * Estimates automatic elapsed minutes for a plain continue generation.
+ * Continue has no new player action text, so its rhythm is inferred from how much text
+ * has accumulated after the last authoritative marker.
+ * @param {number} charsAfter - Characters after the last turn-time marker
+ * @param {number} similarity - Similarity to recent turns (0~1)
+ * @returns {number} Estimated number of minutes
+ */
+function estimateContinuationMinutes(charsAfter = 0, similarity = 0.5) {
+  let score = charsAfter / 950;
+
+  if (charsAfter >= 1800) {
+    score += 0.7;
+  } else if (charsAfter >= 900) {
+    score += 0.35;
+  } else if (charsAfter <= 180) {
+    score -= 0.2;
+  }
+
+  if (similarity >= 0.82) {
+    score -= 0.25;
+  } else if (similarity <= 0.18) {
+    score += 0.15;
+  }
+
+  if (score < 0.4) return 0;
+  if (score < 1.15) return 1;
+  if (score < 2.15) return 2;
+  if (score < 3.2) return 3;
+  return 4;
+}
+
+/**
+ * Get dynamic time factor based on turn content analysis.
+ * This preserves the original WTG "charsAfter * factor" structure while allowing
+ * more scene-specific multipliers.
+ * @param {string} turnText - Text used for dynamic-time classification
+ * @returns {number} Time factor
+ */
+function getDynamicTimeFactor(turnText) {
+  const lowerText = normalizeActionText(turnText).toLowerCase();
+  if (!lowerText) return 1.0;
+
+  const explicitPassagePattern =
+    /\b(later|afterward|afterwards|eventually|overnight|tomorrow|hourly|nightfall|daybreak)\b|after that/;
+  const transitionPattern =
+    /\b(journey|travel|trek|hike|march|ride|sail|fly|drive|walk|cross|return|leave|arrive|reach|head|move|proceed|wait|rest|camp)\b/;
+  const explorationPattern =
+    /\b(search|explore|inspect|investigate|track|follow|climb|descend|enter|open|unlock|gather|cook|tend|examine|study|scout|prepare|work|build|repair)\b/;
   const combatPattern =
     /\b(attack|fight|block|parry|dodge|slash|stab|shoot|strike|lunge|grapple|wrestle)\b/;
-
-  // Pure dialogue, expressions, and minor actions should be the slowest.
   const dialoguePattern =
-    /\b(say|ask|talk|whisper|reply|speak|chat|converse|laugh|cry|smile|frown|sigh|gasp|grin|smirk|nod|shrug|gesture|blink|hesitate|notice|realize|glance|look|watch|listen)\b/;
+    /\b(say|ask|talk|whisper|reply|speak|chat|converse|laugh|cry|smile|frown|sigh|gasp|grin|smirk|nod|shrug|gesture|blink|hesitate|glance|look|notice|realize|watch|listen)\b/;
 
-  let baseMinutes = 1;
-  if (longPassagePattern.test(lower)) {
-    baseMinutes = 4;
-  } else if (transitionPattern.test(lower)) {
-    baseMinutes = 3;
-  } else if (explorationPattern.test(lower)) {
-    baseMinutes = 2;
-  } else if (combatPattern.test(lower)) {
-    baseMinutes = 1;
-  } else if (dialoguePattern.test(lower)) {
-    baseMinutes = 0;
+  let factor = 1.0;
+
+  if (explicitPassagePattern.test(lowerText)) {
+    factor = 1.45;
+  } else if (transitionPattern.test(lowerText)) {
+    factor = 1.1;
+  } else if (explorationPattern.test(lowerText)) {
+    factor = 0.95;
+  } else if (combatPattern.test(lowerText)) {
+    factor = 0.8;
+  } else if (dialoguePattern.test(lowerText)) {
+    factor = 0.65;
   }
 
-  // Higher continuity means the scene usually stays near the same moment, so slow down moderately.
-  let continuityAdjustment = 0;
-  if (similarity >= 0.75) {
-    continuityAdjustment = -1;
-  } else if (similarity <= 0.12) {
-    continuityAdjustment = 1;
+  // Slightly slow down terse turns, but do not collapse them to zero by force.
+  if (lowerText.length <= 60) {
+    factor *= 0.9;
+  } else if (lowerText.length >= 260 && factor < 1.45) {
+    factor *= 1.05;
   }
 
-  // Text length only serves as a small compensation to avoid returning to the old "word count dominates time" problem.
-  let lengthAdjustment = 0;
-  if (charCount >= 1800) {
-    lengthAdjustment = 1;
-  } else if (charCount <= 140 && baseMinutes > 0) {
-    lengthAdjustment = -1;
-  }
-
-  let estimatedMinutes = baseMinutes + continuityAdjustment + lengthAdjustment;
-
-  // Dialogue turns should be capped at 0-1 minutes to avoid fixed minute increments per turn.
-  if (dialoguePattern.test(lower) && !longPassagePattern.test(lower)) {
-    estimatedMinutes = Math.min(1, estimatedMinutes);
-  }
-
-  // Normal automatic flow rate should not exceed 6 minutes; larger time jumps must be left to player commands.
-  return Math.max(0, Math.min(6, estimatedMinutes));
+  return Math.max(0.55, Math.min(1.5, factor));
 }
 
 /**
@@ -1465,6 +1721,8 @@ function onInput_WTG(text) {
   let modifiedText = text;
   let messages = [];
 
+  clearPendingPlayerInput();
+
   // Prioritize handling the dedicated [sleep] command as it completely replaces this input.
   if (text.trim().toLowerCase() === '[sleep]') {
     if (state.currentTime !== 'Unknown') {
@@ -1598,6 +1856,8 @@ function onInput_WTG(text) {
         messages.push('[Invalid command. Available: settime, advance, reset, sleep.]');
       }
       modifiedText = '';
+    } else if (trimmedText) {
+      rememberPendingPlayerInput(text);
     }
   }
 
@@ -1628,40 +1888,26 @@ function onContext_WTG(text) {
   let modifiedText = text;
 
   // Read lightweight turn log for reconstructing history and recovering from erase states.
-  const turnData = getTurnData();
-  const retryDetected = isRetryGeneration(history, turnData);
+  let turnData = getTurnData();
+  const latestAction = getLatestPlayerAction(history);
+  const timingAction = getTimingAction(history);
 
-  // Detect erased or rewritten turns by comparing the most recently saved action with history.
-  // If they don't match, discard future WTG records after the surviving timestamp.
-  if (turnData.length > 0 && history.length > 1) {
-    // Get the most recent player action from history (excluding current action)
-    let previousAction = null;
-    for (let i = history.length - 2; i >= 0; i--) {
-      const action = history[i];
-      if (action.type === "do" || action.type === "say" || action.type === "story") {
-        previousAction = action;
-        break;
-      }
-    }
-
-    // If a previous player action was found, check if an adventure erase was detected
-    if (previousAction) {
-      const lastTurnData = turnData[turnData.length - 1];
-      // If action text doesn't match, treat it as adventure erase detected
-      if (previousAction.text !== lastTurnData.actionText) {
-        // Get the previous turn time from history
-        const {lastTT} = getLastTurnTimeAndChars(history);
-        // If lastTT is zero (no turn time marker), skip cleanup
-        if (lastTT.years > 0 || lastTT.months > 0 || lastTT.days > 0 || lastTT.hours > 0 || lastTT.minutes > 0 || lastTT.seconds > 0) {
-          // Clean WTG Data, removing future turn data
-          cleanupWTGDataCardByTimestamp(lastTT);
-        }
-      }
+  // Only clean future turn data when history has clearly rolled back to a previously saved action.
+  if (!hasPendingPlayerInput() && latestAction && turnData.length > 0) {
+    const latestTurnData = getLatestTurnDataEntry(turnData);
+    const matchingEntry = findMatchingTurnDataEntry(latestAction, turnData);
+    if (
+      latestTurnData &&
+      matchingEntry &&
+      !isSameAction(latestTurnData.actionType, latestTurnData.actionText, latestAction.type, latestAction.text)
+    ) {
+      cleanupWTGDataCardByTimestamp(parseTurnTime(matchingEntry.timestamp));
+      turnData = getTurnData();
     }
   }
 
-  // Re-read turn data after cleanup to ensure subsequent calculations are based on the cleaned timeline.
-  const currentTurnData = getTurnData();
+  const currentTurnData = turnData;
+  const generationAlreadyTimed = state.wtgLastTimedGenerationCount === info.actionCount;
 
   // Build keyword sets for dynamic time similarity calculation.
   let lastKeywords = [];
@@ -1675,7 +1921,9 @@ function onContext_WTG(text) {
     secondLastKeywords = extractKeywords(currentTurnData[currentTurnData.length - 2].actionText + " " + (currentTurnData[currentTurnData.length - 2].responseText || ''));
   }
 
-  // Extract keywords from current text
+  // Follow the original WTG structure: compare this generation's visible context shape
+  // to the last two saved turns, while still allowing pending player input to influence factor selection.
+  const currentTurnText = hasPendingPlayerInput() ? state.wtgPendingPlayerInputRaw : modifiedText;
   const currentKeywords = extractKeywords(modifiedText);
 
   // Calculate similarity with the two most recent turns
@@ -1684,16 +1932,6 @@ function onContext_WTG(text) {
 
   // Store similarity for onOutput_WTG to use (key for two-layer dynamic time merging)
   state.wtgSimilarity = Math.max(similarity1, similarity2);
-
-  // Dynamic time only considers the most recent actual player action to avoid treating the entire context's noise as rhythm.
-  let currentTurnText = modifiedText;
-  for (let i = history.length - 1; i >= 0; i--) {
-    const action = history[i];
-    if (action.type === "do" || action.type === "say" || action.type === "story") {
-      currentTurnText = action.text;
-      break;
-    }
-  }
 
   // Recover the most recent authoritative turn marker and count characters after it.
   const {lastTT, charsAfter, found: markerFound} = getLastTurnTimeAndChars(history);
@@ -1710,8 +1948,8 @@ function onContext_WTG(text) {
 
   let additionalMinutes = 0;
 
-  if (retryDetected) {
-    // Retry only regenerates the AI output for the same action; time should not advance again.
+  if (generationAlreadyTimed) {
+    // Retry regenerates within the same actionCount cycle and must not advance time twice.
     state.turnTime = lastTT;
     const {currentDate, currentTime} = computeCurrent(state.startingDate || WTG_SCENE_START_DATE, state.startingTime || 'Unknown', state.turnTime);
     state.currentDate = currentDate;
@@ -1725,13 +1963,18 @@ function onContext_WTG(text) {
     state.currentTime = currentTime;
     state.changed = true;
   } else if (markerFound) {
-    // When a previous marker exists, use it as baseline
-    // and append elapsed minutes based on text volume after it.
+    // Original WTG model: previous marker + charsAfter/700, then adjust by dynamic factor and similarity.
     const timeMultiplier = getTimeMultiplier();
+    additionalMinutes = Math.floor((charsAfter / 700) * timeMultiplier);
     if (getWTGBooleanSetting("Enable Dynamic Time")) {
-      additionalMinutes = Math.floor(estimateDynamicMinutes(currentTurnText, charsAfter, state.wtgSimilarity) * timeMultiplier);
-    } else {
-      additionalMinutes = Math.floor((charsAfter / 700) * timeMultiplier);
+      additionalMinutes = Math.floor(additionalMinutes * getDynamicTimeFactor(currentTurnText));
+      if (additionalMinutes > 0) {
+        if (similarity1 > 0.3 || similarity2 > 0.3) {
+          additionalMinutes = Math.floor(additionalMinutes * 0.7);
+        } else if (similarity1 < 0.1 && similarity2 < 0.1) {
+          additionalMinutes = Math.floor(additionalMinutes * 1.3);
+        }
+      }
     }
 
     // Update turn time
@@ -1745,14 +1988,19 @@ function onContext_WTG(text) {
     state.currentDate = currentDate;
     state.currentTime = currentTime;
   } else {
-    // If no marker remains, fall back to the in-memory turnTime,
-    // and only advance if startingTime is numeric.
+    // No marker remains; preserve original lightweight fallback using in-memory turnTime.
     if (state.turnTime && state.startingTime !== 'Unknown') {
       const timeMultiplier = getTimeMultiplier();
+      additionalMinutes = Math.floor((charsAfter / 700) * timeMultiplier);
       if (getWTGBooleanSetting("Enable Dynamic Time")) {
-        additionalMinutes = Math.floor(estimateDynamicMinutes(currentTurnText, charsAfter, state.wtgSimilarity) * timeMultiplier);
-      } else {
-        additionalMinutes = Math.floor((charsAfter / 700) * timeMultiplier);
+        additionalMinutes = Math.floor(additionalMinutes * getDynamicTimeFactor(currentTurnText));
+        if (additionalMinutes > 0) {
+          if (similarity1 > 0.3 || similarity2 > 0.3) {
+            additionalMinutes = Math.floor(additionalMinutes * 0.7);
+          } else if (similarity1 < 0.1 && similarity2 < 0.1) {
+            additionalMinutes = Math.floor(additionalMinutes * 1.3);
+          }
+        }
       }
 
       if (additionalMinutes > 0) {
@@ -1765,6 +2013,8 @@ function onContext_WTG(text) {
     }
     // If state.turnTime doesn't exist, keep currentDate/currentTime unchanged
   }
+
+  state.wtgLastTimedGenerationCount = info.actionCount;
 
   // Remove WTG Data entries that are now in the future relative to the reconstructed clock.
   cleanupWTGDataCardByTimestamp(state.turnTime);
@@ -1888,7 +2138,9 @@ function onOutput_WTG(text) {
         break;
       }
     }
-    const retryDetected = isRetryGeneration(history, getTurnData());
+    const pendingInputMatchesLastAction = hasPendingPlayerInput() && lastAction && normalizeActionText(lastAction.text) === state.wtgPendingPlayerInputText;
+    const turnData = getTurnData();
+    const generationAlreadyLogged = state.wtgLastLoggedGenerationCount === info.actionCount;
     // Hidden AI time-skip consumption logic on output side is currently disabled;
     // At this stage, onOutput_WTG only retains text analysis, timestamps, and turn data maintenance.
     // Lightweight mode removes trailing [[turntime]] marker before returning visible body text.
@@ -1898,15 +2150,6 @@ function onOutput_WTG(text) {
     let charCount = narrative.length;
 
     // When there's no hidden AI command to process time, advancing by character count is lightweight's fallback.
-    let minutesToAdd;
-    if (getWTGBooleanSetting("Enable Dynamic Time")) {
-      const turnText = (lastAction ? lastAction.text : '') + ' ' + narrative;
-      const similarity = state.wtgSimilarity !== undefined ? state.wtgSimilarity : 0.5;
-      minutesToAdd = estimateDynamicMinutes(turnText, charCount, similarity);
-    } else {
-      minutesToAdd = Math.floor(charCount / 700);
-    }
-
     // When the model rewrites turn-time metadata, preserve the original warning.
     if (parsedTT) {
       const currentTTForm = formatTurnTime(state.turnTime);
@@ -1947,14 +2190,19 @@ function onOutput_WTG(text) {
     }
 
     // Store lightweight turn data for subsequent reconstruction and erase cleanup.
-    if (lastAction && actionType !== "continue") {
+    if (lastAction && pendingInputMatchesLastAction && actionType !== "continue") {
       const timestamp = formatTurnTime(state.turnTime);
-      if (retryDetected) {
+      if (generationAlreadyLogged) {
         upsertLatestTurnData(actionType, lastAction.text, narrative, timestamp);
       } else {
         addTurnData(actionType, lastAction.text, narrative, timestamp);
       }
       rememberProcessedAction(lastAction);
+      state.wtgLastLoggedGenerationCount = info.actionCount;
+    }
+
+    if (pendingInputMatchesLastAction) {
+      clearPendingPlayerInput();
     }
 
     // When state changes or at periodic checkpoints, refresh the visible date/time storycard.

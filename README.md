@@ -31,7 +31,7 @@ WTG Lightweight Modified is a refactored derivative of WTG 2.0 Lightweight, a pu
 
 ### Changes from Original Lightweight
 
-- **Dynamic Time Rewritten**: Replaced the original 0.7/1.0/1.3 multiplier on character-count minutes with absolute minute estimation (0-6 min) using 5 action categories + similarity/length adjustments. Enabled by default.
+- **Dynamic Time Rewritten**: Enabled by default.
 
 ---
 

@@ -129,20 +129,6 @@ Similarity to recent turns dampens repeated scenes, while low similarity can sli
 
 ---
 
-## Local Verification
-
-Run the smoke tests with Node:
-
-```powershell
-node tests\wtg-smoke.test.js
-```
-
-The tests cover strict time parsing, setting migration, JSON turn data, default-date timestamping, Dynamic Time estimates, and Debug Mode visibility.
-
-When Debug Mode is enabled, the `WTG Debug` card has empty keys so the diagnostic text remains visible to the user without being intentionally pulled into AI context.
-
----
-
 ## License & Credits
 
 **Originally created by**: thedenial

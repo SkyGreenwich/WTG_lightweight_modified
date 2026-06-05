@@ -10,6 +10,8 @@ const WTG_SCENE_START_TIME_MODE = 'random'; // 'random' | 'fixed'
 const WTG_SCENE_FIXED_START_TIME = '8:00 PM'; // Or change it as needed
 const WTG_TURN_DATA_JSON_START = '[Turn Data JSON]';
 const WTG_TURN_DATA_JSON_END = '[/Turn Data JSON]';
+const WTG_DYNAMIC_MAX_AUTO_MINUTES = 6;
+const WTG_DYNAMIC_MAX_EXPLICIT_MINUTES = 10;
 
 // Mapping table for descriptive time expressions
 const descriptiveMap = new Map([
@@ -1636,8 +1638,9 @@ function estimateDynamicElapsedTime(turnText, actionType = 'continue', charsAfte
   const similarityClamped = clampNumber(similarity || 0, 0, 1);
 
   if (explicitMinutes > 0) {
+    const boundedExplicitMinutes = Math.min(explicitMinutes, WTG_DYNAMIC_MAX_EXPLICIT_MINUTES);
     return {
-      minutes: explicitMinutes,
+      minutes: boundedExplicitMinutes,
       category,
       confidence: 1,
       explicitMinutes,
@@ -1647,41 +1650,41 @@ function estimateDynamicElapsedTime(turnText, actionType = 'continue', charsAfte
   }
 
   const categoryBaseMinutes = {
-    dialogue: 0.4,
-    combat: 1,
-    perception: 1,
-    exploration: 4,
-    work: 12,
-    travel: 18,
-    waiting: 20,
-    transition: 8,
+    dialogue: 0.2,
+    combat: 0.8,
+    perception: 0.6,
+    exploration: 1.4,
+    work: 2.0,
+    travel: 2.4,
+    waiting: 2.2,
+    transition: 1.8,
     continue: 0,
-    neutral: actionType === 'story' ? 3 : 1
+    neutral: actionType === 'story' ? 1.2 : 0.6
   };
   const categoryCaps = {
-    dialogue: 2,
-    combat: 4,
-    perception: 3,
-    exploration: 25,
-    work: 75,
-    travel: 120,
-    waiting: 120,
-    transition: 45,
-    continue: 12,
-    neutral: 8
+    dialogue: 1,
+    combat: 2,
+    perception: 2,
+    exploration: 3,
+    work: 4,
+    travel: 5,
+    waiting: 5,
+    transition: 4,
+    continue: 3,
+    neutral: 2
   };
 
-  const textLengthMinutes = Math.min(10, normalizedText.length / 180);
+  const textLengthMinutes = Math.min(1.5, normalizedText.length / 350);
   const continuationMinutes = actionType === 'continue'
-    ? charsAfter / 850
-    : Math.min(6, charsAfter / 1400);
+    ? Math.min(2.5, charsAfter / 1200)
+    : Math.min(1.2, charsAfter / 2400);
 
   let rawMinutes = (categoryBaseMinutes[category] || 1) + textLengthMinutes + continuationMinutes;
   if (category === 'dialogue' && normalizedText.length < 180) {
-    rawMinutes = Math.min(rawMinutes, actionType === 'say' ? 1 : 2);
+    rawMinutes = Math.min(rawMinutes, actionType === 'say' ? 0.75 : 1);
   }
   if (category === 'combat') {
-    rawMinutes = Math.min(rawMinutes, 2 + normalizedText.length / 300);
+    rawMinutes = Math.min(rawMinutes, 1.5 + normalizedText.length / 600);
   }
 
   const similarityFactor = similarityClamped >= 0.65
@@ -1690,7 +1693,7 @@ function estimateDynamicElapsedTime(turnText, actionType = 'continue', charsAfte
   rawMinutes *= similarityFactor;
   rawMinutes *= 1 + deterministicJitter(normalizedText || String(charsAfter), 0.08);
 
-  const cap = categoryCaps[category] || 8;
+  const cap = Math.min(categoryCaps[category] || 2, WTG_DYNAMIC_MAX_AUTO_MINUTES);
   const minutes = rawMinutes < 0.5 ? 0 : Math.round(clampNumber(rawMinutes, 0, cap));
 
   return {

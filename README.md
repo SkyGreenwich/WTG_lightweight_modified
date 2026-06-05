@@ -114,18 +114,20 @@ Older settings named `Disable WTG Entirely` or `Disable WTG` are automatically m
 
 ## Dynamic Time Mode
 
-Dynamic Time first detects explicit elapsed durations. Examples like "wait for two hours", "overnight", or "tomorrow" directly advance the clock by the stated duration.
+Dynamic Time is intentionally conservative. It estimates small turn-by-turn elapsed time so the clock feels alive without letting ordinary actions jump ahead by tens of minutes. Large deliberate jumps should use `[advance]`, `[sleep]`, or `[setcurrent]`.
 
-When no explicit duration is found, it classifies the current turn:
+It classifies the current turn:
 
-- **Dialogue**: Usually 0-2 minutes.
-- **Combat/Perception**: Usually 1-4 minutes.
-- **Exploration**: Several minutes, based on text length and repetition.
-- **Work/Preparation**: Tens of minutes when the action implies sustained effort.
-- **Travel/Waiting**: The largest automatic jumps, capped to avoid runaway drift.
-- **Continue**: Uses accumulated response length after the last authoritative marker.
+- **Dialogue**: Usually 0-1 minute.
+- **Combat/Perception**: Usually 1-2 minutes.
+- **Exploration**: Usually 1-3 minutes.
+- **Work/Preparation**: Usually 2-4 minutes.
+- **Travel/Waiting**: Usually 2-5 minutes.
+- **Continue**: Uses accumulated response length, capped at 3 minutes.
 
-Similarity to recent turns dampens repeated scenes, while low similarity can slightly increase elapsed time. `Time Duration Multiplier` scales the final result.
+Explicit duration phrases are treated as hints, not absolute authority, and are capped at 10 minutes by default. For example, "wait for two hours" records the explicit duration for debug visibility but only advances a conservative amount unless you use `[advance 2 hours]`.
+
+Similarity to recent turns dampens repeated scenes. `Time Duration Multiplier` scales the final result.
 
 ---
 

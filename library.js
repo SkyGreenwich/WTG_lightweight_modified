@@ -12,6 +12,7 @@ const WTG_TURN_DATA_JSON_START = '[Turn Data JSON]';
 const WTG_TURN_DATA_JSON_END = '[/Turn Data JSON]';
 const WTG_DYNAMIC_MAX_AUTO_MINUTES = 6;
 const WTG_DYNAMIC_MAX_EXPLICIT_MINUTES = 10;
+const WTG_CONVERSATION_MAX_AUTO_MINUTES = 1;
 const WTG_TURN_TIME_MARKER_REGEX = /\[\[-?\d+y\d+m\d+d\d+h\d+n\d+s\]\]/g;
 const WTG_STORYCARD_TIMESTAMP_REGEX = /(?:^|\n+)(Discovered on|Met on|Visited) (\d{1,2}\/\d{1,2}\/\d{4})\s+([^\n]+)/;
 const WTG_STORYCARD_TIMESTAMP_REMOVE_REGEX = /\n*(?:Discovered on|Met on|Visited) \d{1,2}\/\d{1,2}\/\d{4}\s+[^\n]+/;
@@ -1205,6 +1206,36 @@ function getLastTurnTimeAndChars(history) {
   return {lastTT, charsAfter, found};
 }
 
+function getRecentHistoryTextAfterLastTurnMarker(historyItems) {
+  const parts = [];
+  let totalLength = 0;
+
+  for (let i = (historyItems || []).length - 1; i >= 0; i--) {
+    const actionText = String(historyItems[i] && historyItems[i].text || '');
+    const markerMatches = [...actionText.matchAll(/\[\[-?\d+y\d+m\d+d\d+h\d+n\d+s\]\]/g)];
+
+    if (markerMatches.length > 0) {
+      const lastMarker = markerMatches[markerMatches.length - 1];
+      const afterMarker = actionText.slice(lastMarker.index + lastMarker[0].length).trim();
+      if (afterMarker) {
+        parts.unshift(afterMarker);
+      }
+      break;
+    }
+
+    if (actionText) {
+      parts.unshift(actionText);
+      totalLength += actionText.length;
+    }
+
+    if (totalLength >= 6000) {
+      break;
+    }
+  }
+
+  return parts.join('\n');
+}
+
 /**
  * Parses date and time strings into a Date object
  * @param {string} dateStr - Date string in mm/dd/yyyy format
@@ -1312,7 +1343,9 @@ function updateWTGDebugCard() {
     `Last dynamic time estimate: +${estimate.minutes} min`,
     `Mode: ${estimate.mode}`,
     `Category: ${estimate.category}`,
+    `Conversation cap: ${estimate.conversationContext ? 'yes' : 'no'}`,
     `Base minutes: ${estimate.baseMinutes}`,
+    `Uncapped minutes: ${estimate.uncappedMinutes}`,
     `Explicit minutes: ${estimate.explicitMinutes}`,
     `Similarity: ${Number(estimate.similarity || 0).toFixed(2)}`,
     `Confidence: ${Number(estimate.confidence || 0).toFixed(2)}`
@@ -1559,6 +1592,59 @@ function countPatternMatches(text, pattern) {
   return matches ? matches.length : 0;
 }
 
+function countQuotedSpeechCharacters(text) {
+  const quotedMatches = String(text || '').match(/"[^"]+"|'[^']+'/g);
+  return quotedMatches ? quotedMatches.join('').length : 0;
+}
+
+function countSpeakerLines(text) {
+  const internalLabels = /^(current date|current time|starting date|starting time|turn time|time duration multiplier|enable dynamic time|debug mode|wtg disabled|mode|category|conversation cap|base minutes|uncapped minutes|explicit minutes|similarity|confidence|last dynamic time estimate)$/i;
+  const lineRegex = /(?:^|\n)\s*([^:\n]{1,32}):\s*(?=\S)/g;
+  let count = 0;
+  let match;
+
+  while ((match = lineRegex.exec(String(text || ''))) !== null) {
+    const label = normalizeActionText(match[1]).toLowerCase();
+    if (!label || internalLabels.test(label)) continue;
+    count++;
+  }
+
+  return count;
+}
+
+function hasConversationTimingContext(text, actionType = 'continue') {
+  if (actionType === 'say') return true;
+  const normalized = normalizeActionText(text);
+  if (!normalized) return false;
+
+  return getDialogueDensity(normalized, actionType) >= 0.25;
+}
+
+function getDialogueDensity(text, actionType = 'continue') {
+  if (actionType === 'say') return 1;
+
+  const normalized = normalizeActionText(text);
+  if (!normalized) return 0;
+
+  const lower = normalized.toLowerCase();
+  const quotedRatio = countQuotedSpeechCharacters(normalized) / Math.max(normalized.length, 1);
+  const quoteMarks = countPatternMatches(normalized, /["']/g);
+  const speechVerbs = countPatternMatches(lower, /\b(say|ask|talk|whisper|reply|speak|chat|converse|argue|explain|answer|mutter|shout|call)\b/g);
+  const speakerLines = countSpeakerLines(normalized);
+
+  let density = quotedRatio;
+  if (quoteMarks >= 2) density += 0.2;
+  if (speechVerbs >= 2) density += 0.15;
+  if (speakerLines >= 2) density += Math.min(0.45, speakerLines * 0.25);
+
+  return clampNumber(density, 0, 1);
+}
+
+function estimateConversationAutoMinutes(text, charsAfter = 0) {
+  const hasTimingText = normalizeActionText(text).length > 0 || (charsAfter || 0) > 0;
+  return hasTimingText ? WTG_CONVERSATION_MAX_AUTO_MINUTES : 0;
+}
+
 function deterministicJitter(text, scale = 0.1) {
   let hash = 0;
   const source = text || 'continue';
@@ -1644,6 +1730,8 @@ function classifyDynamicTime(turnText, actionType = 'continue') {
   if (!lower && actionType === 'continue') {
     return {category: 'continue', score: 0};
   }
+  const dialogueDensity = getDialogueDensity(turnText, actionType);
+  const conversationContext = hasConversationTimingContext(turnText, actionType);
 
   const scores = {
     dialogue: actionType === 'say' ? 2 : 0,
@@ -1658,6 +1746,9 @@ function classifyDynamicTime(turnText, actionType = 'continue') {
   };
 
   scores.dialogue += countPatternMatches(lower, /\b(say|ask|talk|whisper|reply|speak|chat|converse|argue|explain|laugh|cry|smile|frown|sigh|gasp|grin|smirk|nod|shrug|gesture)\b/g);
+  if (dialogueDensity >= 0.35) {
+    scores.dialogue += Math.max(2, Math.round(dialogueDensity * 5));
+  }
   scores.combat += countPatternMatches(lower, /\b(attack|fight|block|parry|dodge|slash|stab|shoot|strike|lunge|grapple|wrestle|reload|aim)\b/g) * 2;
   scores.perception += countPatternMatches(lower, /\b(look|glance|watch|listen|notice|realize|observe|hear|spot)\b/g);
   scores.exploration += countPatternMatches(lower, /\b(search|explore|inspect|investigate|track|follow|climb|descend|enter|open|unlock|examine|study|scout|map)\b/g) * 2;
@@ -1665,6 +1756,10 @@ function classifyDynamicTime(turnText, actionType = 'continue') {
   scores.travel += countPatternMatches(lower, /\b(travel|journey|trek|hike|march|ride|sail|fly|drive|cross|return|leave|arrive|reach|head|move|proceed|walk)\b/g) * 2;
   scores.waiting += countPatternMatches(lower, /\b(wait|rest|pause|linger|camp|relax|recover|keep watch|stand guard)\b/g) * 2;
   scores.transition += countPatternMatches(lower, /\b(later|afterward|afterwards|eventually|meanwhile|then|after that|before long|soon)\b/g);
+
+  if (conversationContext && scores.dialogue >= 2) {
+    return {category: 'dialogue', score: scores.dialogue};
+  }
 
   let bestCategory = 'neutral';
   let bestScore = scores.neutral;
@@ -1711,7 +1806,7 @@ function estimateDynamicElapsedTime(turnText, actionType = 'continue', charsAfte
   }
 
   const categoryBaseMinutes = {
-    dialogue: 0.2,
+    dialogue: 0.05,
     combat: 0.8,
     perception: 0.6,
     exploration: 1.4,
@@ -1735,14 +1830,18 @@ function estimateDynamicElapsedTime(turnText, actionType = 'continue', charsAfte
     neutral: 2
   };
 
-  const textLengthMinutes = Math.min(1.5, normalizedText.length / 350);
-  const continuationMinutes = actionType === 'continue'
+  const textLengthMinutes = category === 'dialogue'
+    ? Math.min(0.55, normalizedText.length / 1800)
+    : Math.min(1.5, normalizedText.length / 350);
+  const continuationMinutes = category === 'dialogue'
+    ? Math.min(actionType === 'continue' ? 0.45 : 0.2, charsAfter / 5000)
+    : actionType === 'continue'
     ? Math.min(2.5, charsAfter / 1200)
     : Math.min(1.2, charsAfter / 2400);
 
   let rawMinutes = (categoryBaseMinutes[category] || 1) + textLengthMinutes + continuationMinutes;
-  if (category === 'dialogue' && normalizedText.length < 180) {
-    rawMinutes = Math.min(rawMinutes, actionType === 'say' ? 0.75 : 1);
+  if (category === 'dialogue') {
+    rawMinutes = Math.min(rawMinutes, 1);
   }
   if (category === 'combat') {
     rawMinutes = Math.min(rawMinutes, 1.5 + normalizedText.length / 600);
@@ -1755,7 +1854,9 @@ function estimateDynamicElapsedTime(turnText, actionType = 'continue', charsAfte
   rawMinutes *= 1 + deterministicJitter(normalizedText || String(charsAfter), 0.08);
 
   const cap = Math.min(categoryCaps[category] || 2, WTG_DYNAMIC_MAX_AUTO_MINUTES);
-  const minutes = rawMinutes < 0.5 ? 0 : Math.round(clampNumber(rawMinutes, 0, cap));
+  const minutes = category === 'dialogue'
+    ? (rawMinutes < 0.9 ? 0 : 1)
+    : (rawMinutes < 0.5 ? 0 : Math.round(clampNumber(rawMinutes, 0, cap)));
 
   return {
     minutes,
@@ -2131,7 +2232,12 @@ function onContext_WTG(text) {
 
   // Follow the original WTG structure: compare this generation's visible context shape
   // to the last two saved turns, while still allowing pending player input to influence factor selection.
-  const currentTurnText = hasPendingPlayerInput() ? state.wtgPendingPlayerInputRaw : modifiedText;
+  const recentHistoryTimingText = getRecentHistoryTextAfterLastTurnMarker(history);
+  const currentTurnText = hasPendingPlayerInput()
+    ? state.wtgPendingPlayerInputRaw
+    : (recentHistoryTimingText || modifiedText);
+  const conversationTimingActionType = timingAction ? timingAction.type : 'continue';
+  const conversationTimingContext = hasConversationTimingContext(currentTurnText, conversationTimingActionType);
   const currentKeywords = extractKeywords(modifiedText);
 
   // Calculate similarity with the two most recent turns
@@ -2159,13 +2265,35 @@ function onContext_WTG(text) {
   const dynamicEnabled = getWTGBooleanSetting("Enable Dynamic Time");
   const timeMultiplier = getTimeMultiplier();
   const estimateAutomaticMinutes = () => {
+    if (conversationTimingContext) {
+      const minutes = estimateConversationAutoMinutes(currentTurnText, charsAfter, timeMultiplier);
+      state.wtgLastDynamicEstimate = {
+        mode: 'conversation',
+        category: 'dialogue',
+        minutes,
+        uncappedMinutes: minutes,
+        conversationContext: true,
+        baseMinutes: minutes,
+        explicitMinutes: extractExplicitDurationMinutes(currentTurnText),
+        similarity: state.wtgSimilarity,
+        confidence: 0.95
+      };
+      return minutes;
+    }
+
     if (dynamicEnabled) {
       const estimate = estimateDynamicElapsedTime(currentTurnText, timingActionType, charsAfter, state.wtgSimilarity);
-      const minutes = Math.floor(estimate.minutes * timeMultiplier);
+      const shouldCapAsConversation = estimate.category === 'dialogue';
+      const uncappedMinutes = Math.floor(estimate.minutes * timeMultiplier);
+      const minutes = shouldCapAsConversation
+        ? Math.min(uncappedMinutes, WTG_CONVERSATION_MAX_AUTO_MINUTES)
+        : uncappedMinutes;
       state.wtgLastDynamicEstimate = {
         mode: 'dynamic',
         category: estimate.category,
         minutes,
+        uncappedMinutes,
+        conversationContext: shouldCapAsConversation,
         baseMinutes: estimate.minutes,
         explicitMinutes: estimate.explicitMinutes,
         similarity: estimate.similarity,
@@ -2174,12 +2302,15 @@ function onContext_WTG(text) {
       return minutes;
     }
 
-    const minutes = Math.floor((charsAfter / 700) * timeMultiplier);
+    const uncappedMinutes = Math.floor((charsAfter / 700) * timeMultiplier);
+    const minutes = uncappedMinutes;
     state.wtgLastDynamicEstimate = {
       mode: 'length',
       category: 'length',
       minutes,
-      baseMinutes: minutes,
+      uncappedMinutes,
+      conversationContext: conversationTimingContext,
+      baseMinutes: uncappedMinutes,
       explicitMinutes: 0,
       similarity: state.wtgSimilarity,
       confidence: 0.4

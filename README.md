@@ -119,7 +119,7 @@ Dynamic Time is intentionally conservative. It estimates small turn-by-turn elap
 
 It classifies the current turn:
 
-- **Dialogue**: Usually 0-1 minute.
+- **Dialogue**: Uses a dedicated slow conversation branch, advancing 1 minute per detected exchange.
 - **Combat/Perception**: Usually 1-2 minutes.
 - **Exploration**: Usually 1-3 minutes.
 - **Work/Preparation**: Usually 2-4 minutes.

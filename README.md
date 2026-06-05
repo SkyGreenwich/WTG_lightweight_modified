@@ -72,6 +72,7 @@ If the target date/time is earlier than the starting date/time, `Turn time` is s
 ### `[advance N unit]`
 
 Jump forward in time. Units: `minutes`, `hours`, `days`, `months`, `years`. Combined values are supported.
+Month and year jumps use calendar-aware clamping, so invalid target dates land on the last valid day of the target month.
 
 ```text
 [advance 30 minutes]

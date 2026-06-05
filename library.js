@@ -12,6 +12,9 @@ const WTG_TURN_DATA_JSON_START = '[Turn Data JSON]';
 const WTG_TURN_DATA_JSON_END = '[/Turn Data JSON]';
 const WTG_DYNAMIC_MAX_AUTO_MINUTES = 6;
 const WTG_DYNAMIC_MAX_EXPLICIT_MINUTES = 10;
+const WTG_TURN_TIME_MARKER_REGEX = /\[\[-?\d+y\d+m\d+d\d+h\d+n\d+s\]\]/g;
+const WTG_STORYCARD_TIMESTAMP_REGEX = /(?:^|\n+)(Discovered on|Met on|Visited) (\d{1,2}\/\d{1,2}\/\d{4})\s+([^\n]+)/;
+const WTG_STORYCARD_TIMESTAMP_REMOVE_REGEX = /\n*(?:Discovered on|Met on|Visited) \d{1,2}\/\d{1,2}\/\d{4}\s+[^\n]+/;
 
 // Mapping table for descriptive time expressions
 const descriptiveMap = new Map([
@@ -320,6 +323,29 @@ function isValidDate(month, day, year) {
   return date.getFullYear() === year && (date.getMonth() + 1) === month && date.getDate() === day;
 }
 
+function getDaysInMonth(year, month) {
+  return new Date(year, month, 0).getDate();
+}
+
+function addCalendarMonthsClampedParts(year, month, day, deltaMonths) {
+  const target = new Date(year, month - 1 + deltaMonths, 1);
+  const targetYear = target.getFullYear();
+  const targetMonth = target.getMonth() + 1;
+  const targetDay = Math.min(day, getDaysInMonth(targetYear, targetMonth));
+  return {year: targetYear, month: targetMonth, day: targetDay};
+}
+
+function buildDateFromParts(parts, timeParts = {}) {
+  return new Date(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    timeParts.hour || 0,
+    timeParts.min || 0,
+    timeParts.sec || 0
+  );
+}
+
 /**
  * Advances a date by a specified number of days
  * @param {string} dateStr - Date string in mm/dd/yyyy format
@@ -591,9 +617,11 @@ function computeCurrent(startingDate, startingTime, tt) {
     return { currentDate, currentTime: 'Unknown' };
   }
   let [month, day, year] = startingDate.split('/').map(Number);
-  let date = new Date(year, month - 1, day);
-  date.setFullYear(date.getFullYear() + sign * (tt.years || 0));
-  date.setMonth(date.getMonth() + sign * (tt.months || 0));
+  const totalCalendarMonths = sign * (((tt.years || 0) * 12) + (tt.months || 0));
+  let dateParts = totalCalendarMonths
+    ? addCalendarMonthsClampedParts(year, month, day, totalCalendarMonths)
+    : {year, month, day};
+  let date = buildDateFromParts(dateParts);
   date.setDate(date.getDate() + sign * (tt.days || 0));
   let {time, days} = advanceTime(startingTime, sign * (tt.hours || 0), sign * (tt.minutes || 0), sign * (tt.seconds || 0));
   date.setDate(date.getDate() + days);
@@ -626,6 +654,14 @@ function compareTurnTime(tt1, tt2) {
 
   tt1 = normalizeTurnTimeSign(tt1);
   tt2 = normalizeTurnTimeSign(tt2);
+  const comparable1 = getComparableTurnTimeValue(tt1);
+  const comparable2 = getComparableTurnTimeValue(tt2);
+  if (Number.isFinite(comparable1) && Number.isFinite(comparable2)) {
+    if (comparable1 < comparable2) return -1;
+    if (comparable1 > comparable2) return 1;
+    return 0;
+  }
+
   const sign1 = getTurnTimeSign(tt1);
   const sign2 = getTurnTimeSign(tt2);
   if (sign1 !== sign2) return sign1 < sign2 ? -1 : 1;
@@ -638,6 +674,16 @@ function compareTurnTime(tt1, tt2) {
   if (tt1.minutes !== tt2.minutes) return direction * (tt1.minutes < tt2.minutes ? -1 : 1);
   if (tt1.seconds !== tt2.seconds) return direction * (tt1.seconds < tt2.seconds ? -1 : 1);
   return 0;
+}
+
+function getComparableTurnTimeValue(tt) {
+  if (typeof state === 'undefined' || !state || !state.startingDate || !state.startingTime || !parseClockTime(state.startingTime)) {
+    return NaN;
+  }
+
+  const current = computeCurrent(state.startingDate, state.startingTime, tt);
+  const parsed = parseDateTime(current.currentDate, current.currentTime);
+  return parsed ? parsed.getTime() : NaN;
 }
 
 function normalizeTurnDataRecord(record) {
@@ -1035,22 +1081,22 @@ function cleanupStoryCardsByTimestamp(currentDate, currentTime) {
   for (let i = storyCards.length - 1; i >= 0; i--) {
     const card = storyCards[i];
 
-    // Skip WTG Data card and cards without entry
-    if (card.title === "WTG Data" || card.title === "Current Date and Time" || card.title === "WTG Debug" || !card.entry) {
+    // Skip internal WTG cards and cards without entry
+    if (isWTGInternalCard(card) || !card.entry) {
       continue;
     }
 
     // Check if the card has a timestamp
-    const discoveredMatch = card.entry.match(/(?:Discovered on|Met on|Visited) (\d{1,2}\/\d{1,2}\/\d{4})\s+(.+)/);
+    const discoveredMatch = card.entry.match(WTG_STORYCARD_TIMESTAMP_REGEX);
     if (discoveredMatch) {
-      const cardDate = discoveredMatch[1];
-      const cardTime = discoveredMatch[2];
+      const cardDate = discoveredMatch[2];
+      const cardTime = discoveredMatch[3];
       const cardDateTime = parseDateTime(cardDate, cardTime);
       if (!cardDateTime) continue;
 
       // If card timestamp is later than current time, remove the timestamp
       if (cardDateTime > currentDateTime) {
-        card.entry = card.entry.replace(/\n\n(?:Discovered on|Met on|Visited) .+/, '');
+        card.entry = card.entry.replace(WTG_STORYCARD_TIMESTAMP_REMOVE_REGEX, '').trimEnd();
       }
     }
   }
@@ -1080,32 +1126,29 @@ function getDateDiff(startStr, startTimeStr, endStr, endTimeStr) {
   if (end < start) {
     return secondsToTurnTime((end.getTime() - start.getTime()) / 1000);
   }
-  let years = end.getFullYear() - start.getFullYear();
-  let months = end.getMonth() - start.getMonth();
-  let days = end.getDate() - start.getDate();
-  let hours = end.getHours() - start.getHours();
-  let minutes = end.getMinutes() - start.getMinutes();
-  let seconds = end.getSeconds() - start.getSeconds();
-  if (seconds < 0) {
-    minutes--;
-    seconds += 60;
+
+  let totalMonths = (eYear - sYear) * 12 + (eMonth - sMonth);
+  let cursorParts = addCalendarMonthsClampedParts(sYear, sMonth, sDay, totalMonths);
+  let cursor = buildDateFromParts(cursorParts, startParsed);
+  while (totalMonths > 0 && cursor > end) {
+    totalMonths--;
+    cursorParts = addCalendarMonthsClampedParts(sYear, sMonth, sDay, totalMonths);
+    cursor = buildDateFromParts(cursorParts, startParsed);
   }
-  if (minutes < 0) {
-    hours--;
-    minutes += 60;
-  }
-  if (hours < 0) {
-    days--;
-    hours += 24;
-  }
-  if (days < 0) {
-    months--;
-    days += new Date(end.getFullYear(), end.getMonth(), 0).getDate();
-  }
-  if (months < 0) {
-    years--;
-    months += 12;
-  }
+
+  let remainingMs = end.getTime() - cursor.getTime();
+  let days = Math.floor(remainingMs / 86400000);
+  cursor.setDate(cursor.getDate() + days);
+  remainingMs = end.getTime() - cursor.getTime();
+
+  let remainingSeconds = Math.max(0, Math.round(remainingMs / 1000));
+  let hours = Math.floor(remainingSeconds / 3600);
+  remainingSeconds %= 3600;
+  let minutes = Math.floor(remainingSeconds / 60);
+  let seconds = remainingSeconds % 60;
+  let years = Math.floor(totalMonths / 12);
+  let months = totalMonths % 12;
+
   return normalizeTurnTimeSign({sign: 1, years, months, days, hours, minutes, seconds});
 }
 
@@ -1242,6 +1285,15 @@ function getWTGDebugCard(createIfMissing = true) {
   return debugCard;
 }
 
+function isWTGInternalCard(card) {
+  if (!card || !card.title) return false;
+  return card.title === "WTG Data"
+    || card.title === "Current Date and Time"
+    || card.title === "World Time Generator Settings"
+    || card.title === "WTG Debug"
+    || card.title === "WTG Cooldowns";
+}
+
 function updateWTGDebugCard() {
   if (!getWTGBooleanSetting("Debug Mode")) {
     const existingCard = getWTGDebugCard(false);
@@ -1276,9 +1328,12 @@ function addTimestampToCard(card, timestamp) {
   if (!timestamp || timestamp.includes("Unknown")) {
     return;
   }
+  if (isWTGInternalCard(card)) {
+    return;
+  }
 
   // Only append if the card doesn't already have a timestamp
-  if (card && card.entry && !card.entry.includes("Discovered on") && !card.entry.includes("Met on") && !card.entry.includes("Visited")) {
+  if (card && card.entry && !hasTimestamp(card)) {
     // Choose appropriate discovery verb based on card type
     let discoveryVerb = "Discovered on";
 
@@ -1298,7 +1353,7 @@ function addTimestampToCard(card, timestamp) {
  * @returns {boolean} True if already has timestamp
  */
 function hasTimestamp(card) {
-  return card && card.entry && (card.entry.includes("Discovered on") || card.entry.includes("Met on") || card.entry.includes("Visited"));
+  return Boolean(card && card.entry && WTG_STORYCARD_TIMESTAMP_REGEX.test(card.entry));
 }
 
 /**
@@ -1319,9 +1374,15 @@ function isCardKeywordMentioned(card, text) {
   for (const key of keys) {
     if (!key) continue;
 
-    // Check if the key appears as a whole word in the text
-    // Use word boundaries to avoid partial matches
-    const keyRegex = new RegExp('\\b' + key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
+    if (/[^\x00-\x7F]/.test(key)) {
+      if (normalizedText.includes(key)) {
+        return true;
+      }
+      continue;
+    }
+
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const keyRegex = new RegExp(`(^|[^A-Za-z0-9_])${escapedKey}(?=$|[^A-Za-z0-9_])`, 'i');
     if (keyRegex.test(normalizedText)) {
       return true;
     }
@@ -1337,8 +1398,8 @@ function isCardKeywordMentioned(card, text) {
  */
 function getCardTimestamp(card) {
   if (!card || !card.entry) return null;
-  const match = card.entry.match(/(?:Discovered on|Met on|Visited) (\d{1,2}\/\d{1,2}\/\d{4})\s+(.+)/);
-  return match ? `${match[1]} ${match[2]}` : null;
+  const match = card.entry.match(WTG_STORYCARD_TIMESTAMP_REGEX);
+  return match ? `${match[2]} ${match[3]}` : null;
 }
 
 /**
@@ -1353,7 +1414,7 @@ function updateAllStoryCardTimestamps(newDate, newTime) {
     const card = storyCards[i];
 
     // Skip system cards
-    if (card.title === "WTG Data" || card.title === "Current Date and Time" || card.title === "World Time Generator Settings" || card.title === "WTG Debug") {
+    if (isWTGInternalCard(card)) {
       continue;
     }
 
@@ -1804,8 +1865,10 @@ function sanitizeSystemLeakage(outputText) {
   // Remove internal tags and explicit system command leakage.
   cleaned = cleaned.replace(/<scratchpad>[\s\S]*?<\/scratchpad>/gi, '');
   cleaned = cleaned.replace(/\[(settime\s+[^\]]+|setcurrent\s+[^\]]+|advance\s+[^\]]+|reset|sleep)\]/gi, '');
+  cleaned = cleaned.replace(WTG_TURN_TIME_MARKER_REGEX, '');
 
   // Collapse any excess blank lines and edge whitespace that may result from cleanup.
+  cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
   return cleaned;
 }
@@ -2291,17 +2354,12 @@ function onOutput_WTG(text) {
 
   // Timestamp storycards mentioned in the combined "player action + AI response" text.
   if (lastAction && hasSettimeBeenInitialized() && state.currentTime !== 'Unknown') {
-    const dateTimeCard = storyCards.find(card => card.title === "Current Date and Time");
-    if (dateTimeCard) {
-      addTimestampToCard(dateTimeCard, `${state.currentDate} ${state.currentTime}`);
-    }
-
     const combinedText = (lastAction ? lastAction.text : '') + ' ' + modifiedText;
 
     for (let i = 0; i < storyCards.length; i++) {
       const card = storyCards[i];
 
-      if (card.title === "WTG Data" || card.title === "Current Date and Time" || card.title === "World Time Generator Settings" || card.title === "WTG Debug" || card.title === "WTG Cooldowns") {
+      if (isWTGInternalCard(card)) {
         continue;
       }
 

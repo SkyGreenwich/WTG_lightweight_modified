@@ -347,6 +347,33 @@ function buildDateFromParts(parts, timeParts = {}) {
   );
 }
 
+function advanceDateTimeValue(dateStr, timeStr, add = {}) {
+  const parsedDate = normalizeDateInput(dateStr);
+  const parsedTime = parseClockTime(timeStr);
+  if (parsedDate.error || !parsedTime) return null;
+
+  const totalMonths = (add.years || 0) * 12 + (add.months || 0);
+  const dateParts = totalMonths
+    ? addCalendarMonthsClampedParts(parsedDate.year, parsedDate.month, parsedDate.day, totalMonths)
+    : {year: parsedDate.year, month: parsedDate.month, day: parsedDate.day};
+  const date = buildDateFromParts(dateParts);
+  date.setDate(date.getDate() + (add.days || 0));
+
+  const advancedTime = advanceTime(
+    parsedTime.display,
+    add.hours || 0,
+    add.minutes || 0,
+    add.seconds || 0
+  );
+  if (!advancedTime.valid) return null;
+
+  date.setDate(date.getDate() + advancedTime.days);
+  return {
+    date: `${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}/${date.getFullYear()}`,
+    time: advancedTime.time
+  };
+}
+
 /**
  * Advances a date by a specified number of days
  * @param {string} dateStr - Date string in mm/dd/yyyy format
@@ -382,57 +409,13 @@ function advanceTime(timeStr, hours = 0, minutes = 0, seconds = 0) {
   let addedSeconds = hours * 3600 + minutes * 60 + seconds;
   let totalSeconds = currentSeconds + addedSeconds;
   let extraDays = Math.floor(totalSeconds / 86400);
-  let wrappedSeconds = totalSeconds % 86400;
-  if (wrappedSeconds < 0) {
-    wrappedSeconds += 86400;
-    extraDays--;
-  }
+  let wrappedSeconds = totalSeconds - extraDays * 86400;
 
   let hour = Math.floor(wrappedSeconds / 3600);
   let remaining = wrappedSeconds % 3600;
   let min = Math.floor(remaining / 60);
   let sec = remaining % 60;
   return { time: formatClockTime(hour, min, sec), days: extraDays, valid: true };
-}
-
-/**
- * Capitalizes the first letter of a string, or converts time to 12-hour format
- * @param {string} str - String to process
- * @returns {string} Processed string or formatted time
- */
-function capitalize(str) {
-  str = str || 'Unknown';
-  if (str === 'Unknown') return str;
-  if (/\d/.test(str)) {
-    if (/^\d{1,2}:\d{2}$/.test(str)) {
-      return convertTo12Hour(str);
-    }
-    str = str.replace(/\s*(am|pm|a\.m\.|p\.m\.)$/i, (match, meridiem) => ` ${meridiem.replace(/\./g, '').toUpperCase()}`);
-    if (!/:\d{2}/.test(str)) {
-      str = str.replace(/(\d+)\s*([AP]M)?$/i, (match, p1, p2) => {
-        let period = p2 ? ` ${p2.toUpperCase()}` : '';
-        return `${p1}:00${period}`;
-      });
-    }
-    return str;
-  } else {
-    return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
-  }
-}
-
-/**
- * Converts 24-hour time to 12-hour format
- * @param {string} timeStr - 24-hour time string (hh:mm)
- * @returns {string} 12-hour time string (h:mm AM/PM)
- */
-function convertTo12Hour(timeStr) {
-  const [hourStr, minStr] = timeStr.split(':');
-  let hour = parseInt(hourStr, 10);
-  let min = minStr ? `:${minStr}` : ':00';
-  const period = (hour < 12) ? 'AM' : 'PM';
-  if (hour === 0) hour = 12;
-  if (hour > 12) hour -= 12;
-  return `${hour}${min} ${period}`;
 }
 
 /**
@@ -677,6 +660,28 @@ function compareTurnTime(tt1, tt2) {
   return 0;
 }
 
+function getElapsedMinutesBetweenTurnTimes(startTT, endTT) {
+  if (!startTT || !endTT) return 0;
+
+  if (
+    typeof state !== 'undefined' &&
+    state &&
+    state.startingDate &&
+    state.startingTime &&
+    parseClockTime(state.startingTime)
+  ) {
+    const startCurrent = computeCurrent(state.startingDate, state.startingTime, startTT);
+    const endCurrent = computeCurrent(state.startingDate, state.startingTime, endTT);
+    const startDate = parseDateTime(startCurrent.currentDate, startCurrent.currentTime);
+    const endDate = parseDateTime(endCurrent.currentDate, endCurrent.currentTime);
+    if (startDate && endDate) {
+      return Math.floor((endDate.getTime() - startDate.getTime()) / 60000);
+    }
+  }
+
+  return Math.floor((turnTimeToApproxSeconds(endTT) - turnTimeToApproxSeconds(startTT)) / 60);
+}
+
 function getComparableTurnTimeValue(tt) {
   if (typeof state === 'undefined' || !state || !state.startingDate || !state.startingTime || !parseClockTime(state.startingTime)) {
     return NaN;
@@ -837,26 +842,14 @@ function isSameAction(typeA, textA, typeB, textB) {
 }
 
 /**
- * Builds a stable action signature for retry/erase identity checks.
- * @param {string} type - Action type
- * @param {string} text - Action text
- * @returns {string} Stable signature
- */
-function getActionSignature(type, text) {
-  return `${type || ''}:${normalizeActionText(text)}`;
-}
-
-/**
  * Records the most recent player action that WTG has accepted and written to the timeline.
  * This state is used to distinguish "genuinely new actions" from "retry regeneration of the same action".
  * @param {Object|null} action - Most recent player action
  */
 function rememberProcessedAction(action) {
   if (!action) return;
-  state.wtgLastProcessedActionCount = info.actionCount;
   state.wtgLastProcessedActionType = action.type;
   state.wtgLastProcessedActionText = normalizeActionText(action.text);
-  state.wtgLastProcessedActionSignature = getActionSignature(action.type, action.text);
 }
 
 /**
@@ -869,8 +862,6 @@ function rememberPendingPlayerInput(text) {
   if (!normalizedText) return;
   state.wtgPendingPlayerInputText = normalizedText;
   state.wtgPendingPlayerInputRaw = String(text || '');
-  state.wtgPendingPlayerInputCount = info.actionCount;
-  state.wtgPendingPlayerInputNeedsTiming = true;
 }
 
 /**
@@ -879,8 +870,6 @@ function rememberPendingPlayerInput(text) {
 function clearPendingPlayerInput() {
   delete state.wtgPendingPlayerInputText;
   delete state.wtgPendingPlayerInputRaw;
-  delete state.wtgPendingPlayerInputCount;
-  delete state.wtgPendingPlayerInputNeedsTiming;
 }
 
 /**
@@ -889,14 +878,6 @@ function clearPendingPlayerInput() {
  */
 function hasPendingPlayerInput() {
   return Boolean(state.wtgPendingPlayerInputText);
-}
-
-/**
- * Checks whether a pending player input still needs automatic timing for this cycle.
- * @returns {boolean} True if automatic timing has not yet been consumed
- */
-function hasFreshPendingPlayerInput() {
-  return Boolean(state.wtgPendingPlayerInputText && state.wtgPendingPlayerInputNeedsTiming);
 }
 
 /**
@@ -913,7 +894,7 @@ function getTimingAction(historyItems) {
       return latestAction;
     }
     return {
-      type: latestAction ? latestAction.type : 'do',
+      type: 'do',
       text: state.wtgPendingPlayerInputRaw || state.wtgPendingPlayerInputText
     };
   }
@@ -975,55 +956,61 @@ function isRetryGeneration(historyItems, turnData) {
     latestAction.type,
     latestAction.text
   );
-  const sameProcessedActionCount = state.wtgLastProcessedActionCount === info.actionCount;
   const previousResponseStillPresent = isResponseStillPresentInHistory(historyItems, latestTurnData.responseText);
 
-  return Boolean(sameProcessedAction && sameProcessedActionCount && sameTurnDataAction && !previousResponseStillPresent);
+  return Boolean(sameProcessedAction && sameTurnDataAction && !previousResponseStillPresent);
 }
 
 /**
- * Finds the newest persisted turn entry that matches the specified player action.
+ * Finds the persisted turn entry that best matches the recent player-action sequence.
  * @param {Object|null} action - Most recent player action
  * @param {Array} turnData - Array returned by getTurnData()
+ * @param {Array} historyItems - Current history array
  * @returns {Object|null} Matching persisted turn entry; null if none exists
  */
-function findMatchingTurnDataEntry(action, turnData) {
+function findMatchingTurnDataEntry(action, turnData, historyItems = []) {
   if (!action || !turnData || turnData.length === 0) return null;
+
+  const recentActions = (historyItems || []).filter(item => {
+    if (!item || (item.type !== 'do' && item.type !== 'say' && item.type !== 'story')) return false;
+    return turnData.some(record => isSameAction(record.actionType, record.actionText, item.type, item.text));
+  });
+
+  let bestEntry = null;
+  let bestScore = -1;
   for (let i = turnData.length - 1; i >= 0; i--) {
     const entry = turnData[i];
-    if (isSameAction(entry.actionType, entry.actionText, action.type, action.text)) {
-      return entry;
+    if (!isSameAction(entry.actionType, entry.actionText, action.type, action.text)) continue;
+
+    let historyIndex = recentActions.length - 1;
+    let turnDataIndex = i;
+    let score = entry.responseText && isResponseStillPresentInHistory(historyItems, entry.responseText)
+      ? 100
+      : 0;
+    let sequenceMatches = 0;
+    while (historyIndex >= 0 && turnDataIndex >= 0 && sequenceMatches < 8) {
+      const historyAction = recentActions[historyIndex];
+      const turnRecord = turnData[turnDataIndex];
+      if (!isSameAction(
+        turnRecord.actionType,
+        turnRecord.actionText,
+        historyAction.type,
+        historyAction.text
+      )) {
+        break;
+      }
+      score++;
+      sequenceMatches++;
+      historyIndex--;
+      turnDataIndex--;
+    }
+
+    if (score > bestScore) {
+      bestEntry = entry;
+      bestScore = score;
     }
   }
-  return null;
-}
-
-/**
- * Checks whether the latest persisted turn already corresponds to the same player action.
- * @param {Object|null} action - Most recent player action
- * @param {Array} turnData - Array returned by getTurnData()
- * @returns {boolean} True if the latest persisted turn already matches the action
- */
-function isActionAlreadyTimed(action, turnData) {
-  if (!action || !turnData || turnData.length === 0) return false;
-  const latestTurnData = getLatestTurnDataEntry(turnData);
-  return Boolean(latestTurnData && isSameAction(latestTurnData.actionType, latestTurnData.actionText, action.type, action.text));
-}
-
-/**
- * Checks whether the current generation is reusing the same player action without a new submission.
- * This acts as the primary retry/erase+continue guard for time advancement.
- * @param {Object|null} action - Most recent player action
- * @returns {boolean} True if this should be treated as a retry-like regeneration
- */
-function isRetryLikeAction(action) {
-  if (hasPendingPlayerInput() || !action) return false;
-
-  const currentSignature = getActionSignature(action.type, action.text);
-  const sameProcessedAction = state.wtgLastProcessedActionSignature === currentSignature;
-  const sameActionCount = state.wtgLastProcessedActionCount === info.actionCount;
-
-  return Boolean(sameProcessedAction && sameActionCount);
+  return bestEntry;
 }
 
 /**
@@ -1087,11 +1074,11 @@ function cleanupStoryCardsByTimestamp(currentDate, currentTime) {
       continue;
     }
 
-    // Check if the card has a timestamp
-    const discoveredMatch = card.entry.match(WTG_STORYCARD_TIMESTAMP_REGEX);
-    if (discoveredMatch) {
-      const cardDate = discoveredMatch[2];
-      const cardTime = discoveredMatch[3];
+    const cardTimestamp = getCardTimestamp(card);
+    if (cardTimestamp) {
+      const separatorIndex = cardTimestamp.indexOf(' ');
+      const cardDate = cardTimestamp.slice(0, separatorIndex);
+      const cardTime = cardTimestamp.slice(separatorIndex + 1);
       const cardDateTime = parseDateTime(cardDate, cardTime);
       if (!cardDateTime) continue;
 
@@ -1121,9 +1108,15 @@ function getDateDiff(startStr, startTimeStr, endStr, endTimeStr) {
   }
 
   let [sMonth, sDay, sYear] = startDate.date.split('/').map(Number);
-  let start = new Date(sYear, sMonth - 1, sDay, startParsed.hour, startParsed.min, startParsed.sec);
+  let start = buildDateFromParts(
+    {year: sYear, month: sMonth, day: sDay},
+    startParsed
+  );
   let [eMonth, eDay, eYear] = endDate.date.split('/').map(Number);
-  let end = new Date(eYear, eMonth - 1, eDay, endParsed.hour, endParsed.min, endParsed.sec);
+  let end = buildDateFromParts(
+    {year: eYear, month: eMonth, day: eDay},
+    endParsed
+  );
   if (end < start) {
     return secondsToTurnTime((end.getTime() - start.getTime()) / 1000);
   }
@@ -1179,10 +1172,15 @@ function getLastTurnTimeAndChars(history) {
   let charsAfter = 0;
   let found = false;
   for (let i = history.length - 1; i >= 0; i--) {
-    const actionText = history[i].text;
-    const match = actionText.match(/\[\[(-?\d+y\d+m\d+d\d+h\d+n\d+s)\]\]/);
-    if (match) {
-      lastTT = parseTurnTime(match[1]);
+    const actionText = String(history[i] && history[i].text || '');
+    const markerRegex = /\[\[(-?\d+y\d+m\d+d\d+h\d+n\d+s)\]\]/g;
+    let match;
+    let lastMatch = null;
+    while ((match = markerRegex.exec(actionText)) !== null) {
+      lastMatch = match;
+    }
+    if (lastMatch) {
+      lastTT = parseTurnTime(lastMatch[1]);
       found = true;
       break;
     } else {
@@ -1197,43 +1195,36 @@ function getLastTurnTimeAndChars(history) {
       lastTT = wtgDataTimestamp;
       found = true;
       // If recovering from WTG Data, only count the last action's character length
-      charsAfter = history.length > 0 ? history[history.length - 1].text.length : 0;
+      charsAfter = history.length > 0 ? String(history[history.length - 1] && history[history.length - 1].text || '').length : 0;
     } else {
       // Only use cumulative character count when there's no timestamp source at all
-      charsAfter = history.reduce((sum, action) => sum + action.text.length, 0);
+      charsAfter = history.reduce((sum, action) => sum + String(action && action.text || '').length, 0);
     }
   }
   return {lastTT, charsAfter, found};
 }
 
 function getRecentHistoryTextAfterLastTurnMarker(historyItems) {
-  const parts = [];
-  let totalLength = 0;
+  const markerRegex = /\[\[-?\d+y\d+m\d+d\d+h\d+n\d+s\]\]/g;
 
   for (let i = (historyItems || []).length - 1; i >= 0; i--) {
     const actionText = String(historyItems[i] && historyItems[i].text || '');
-    const markerMatches = [...actionText.matchAll(/\[\[-?\d+y\d+m\d+d\d+h\d+n\d+s\]\]/g)];
+    let lastMarker = null;
+    let markerMatch;
 
-    if (markerMatches.length > 0) {
-      const lastMarker = markerMatches[markerMatches.length - 1];
-      const afterMarker = actionText.slice(lastMarker.index + lastMarker[0].length).trim();
-      if (afterMarker) {
-        parts.unshift(afterMarker);
-      }
-      break;
+    markerRegex.lastIndex = 0;
+    while ((markerMatch = markerRegex.exec(actionText)) !== null) {
+      lastMarker = markerMatch;
     }
 
-    if (actionText) {
-      parts.unshift(actionText);
-      totalLength += actionText.length;
+    if (lastMarker) {
+      return actionText.slice(lastMarker.index + lastMarker[0].length).trim();
     }
 
-    if (totalLength >= 6000) {
-      break;
-    }
+    if (actionText.trim()) return actionText;
   }
 
-  return parts.join('\n');
+  return '';
 }
 
 /**
@@ -1250,7 +1241,7 @@ function parseDateTime(dateStr, timeStr) {
   const time = parseTime(timeStr);
   if (!time.valid) return null;
 
-  return new Date(year, month - 1, day, time.hour, time.min, time.sec);
+  return buildDateFromParts({year, month, day}, time);
 }
 
 /**
@@ -1265,10 +1256,14 @@ function getWTGDataCard() {
     dataCard = storyCards.find(card => card.title === "WTG Data");
     if (dataCard) {
       dataCard.type = "system";
-      dataCard.keys = "wtg_internal_data,do_not_include_in_context";
+      dataCard.keys = "";
       dataCard.entry = "";
       dataCard.description = "System data for World Time Generator - Internal use only, do not include in context";
     }
+  }
+  if (dataCard) {
+    dataCard.type = "system";
+    dataCard.keys = "";
   }
   return dataCard;
 }
@@ -1287,6 +1282,54 @@ function getCurrentDateTimeCard() {
     dateTimeCard.description = "Commands:\n[settime mm/dd/yyyy time] - Set starting date and time\n[setcurrent mm/dd/yyyy [time]] - Set current date/time without changing the start\n[advance N [minutes|hours|days|months|years] or combos like 1month 2days] - Advance time/date\n[sleep] - Sleep and advance time based on the current clock\n[reset] - Reset to most recent mention in history";
   }
   return dateTimeCard;
+}
+
+function recoverClockStateFromDateTimeCard() {
+  const dateTimeCard = storyCards.find(card => card.title === "Current Date and Time");
+  if (!dateTimeCard || !dateTimeCard.entry) return false;
+
+  const startingDateMatch = dateTimeCard.entry.match(/^\s*Starting date:\s*(.+)\s*$/im);
+  const startingTimeMatch = dateTimeCard.entry.match(/^\s*Starting time:\s*(.+)\s*$/im);
+  const turnTimeMatch = dateTimeCard.entry.match(/^\s*Turn time:\s*(-?\d+y\d+m\d+d\d+h\d+n\d+s)\s*$/im);
+  if (!startingDateMatch || !startingTimeMatch || !turnTimeMatch) return false;
+
+  const parsedDate = normalizeDateInput(startingDateMatch[1]);
+  const normalizedTime = normalizeTime(startingTimeMatch[1]);
+  const parsedTurnTime = parseTurnTime(turnTimeMatch[1]);
+  if (parsedDate.error || !normalizedTime || !parsedTurnTime) return false;
+
+  state.startingDate = parsedDate.date;
+  state.startingTime = normalizedTime;
+  state.turnTime = parsedTurnTime;
+  const current = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
+  state.currentDate = current.currentDate;
+  state.currentTime = current.currentTime;
+  state.settimeInitialized = true;
+  return true;
+}
+
+function ensureClockStateInitialized() {
+  const parsedStartDate = state.startingDate
+    ? normalizeDateInput(state.startingDate)
+    : {error: true};
+  const validStartTime = state.startingTime && parseClockTime(state.startingTime);
+
+  if (parsedStartDate.error || !validStartTime) {
+    if (recoverClockStateFromDateTimeCard()) return;
+
+    state.startingDate = WTG_SCENE_START_DATE;
+    state.startingTime = getSceneDefaultStartTime();
+    state.turnTime = {years:0, months:0, days:0, hours:0, minutes:0, seconds:0};
+    state.settimeInitialized = true;
+  } else {
+    state.startingDate = parsedStartDate.date;
+    state.startingTime = validStartTime.display;
+    state.turnTime = normalizeTurnTimeSign(state.turnTime);
+  }
+
+  const current = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
+  state.currentDate = current.currentDate;
+  state.currentTime = current.currentTime;
 }
 
 /**
@@ -1344,7 +1387,9 @@ function updateWTGDebugCard() {
     `Mode: ${estimate.mode}`,
     `Category: ${estimate.category}`,
     `Conversation cap: ${estimate.conversationContext ? 'yes' : 'no'}`,
-    `Base minutes: ${estimate.baseMinutes}`,
+    `Semantic minutes: ${estimate.baseMinutes || 0}`,
+    `Length baseline: ${estimate.lengthMinutes || 0}`,
+    `Length catch-up: ${estimate.lengthCatchupMinutes || 0}`,
     `Uncapped minutes: ${estimate.uncappedMinutes}`,
     `Explicit minutes: ${estimate.explicitMinutes}`,
     `Similarity: ${Number(estimate.similarity || 0).toFixed(2)}`,
@@ -1407,13 +1452,6 @@ function isCardKeywordMentioned(card, text) {
   for (const key of keys) {
     if (!key) continue;
 
-    if (/[^\x00-\x7F]/.test(key)) {
-      if (normalizedText.includes(key)) {
-        return true;
-      }
-      continue;
-    }
-
     const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const keyRegex = new RegExp(`(^|[^A-Za-z0-9_])${escapedKey}(?=$|[^A-Za-z0-9_])`, 'i');
     if (keyRegex.test(normalizedText)) {
@@ -1425,7 +1463,7 @@ function isCardKeywordMentioned(card, text) {
 }
 
 /**
- * Extracts a timestamp from a storycard
+ * Extracts a timestamp from a storycard.
  * @param {Object} card - Storycard to check
  * @returns {string|null} Timestamp string if found, null otherwise
  */
@@ -1508,11 +1546,10 @@ function getWTGSettingsCard() {
     settingsCard.keys = ""; // No keys to avoid entering AI context
     settingsCard.description = "World Time Generator Settings - Edit the values below to configure the system.";
     settingsCard.entry = `Time Duration Multiplier: 1.0
-Enable Dynamic Time: true
 Debug Mode: false
 WTG Disabled: false`;
   } else {
-    // Always ensure keys is empty
+    settingsCard.type = "system";
     settingsCard.keys = "";
     migrateWTGSettings(settingsCard);
   }
@@ -1535,6 +1572,7 @@ function migrateWTGSettings(settingsCard) {
   settingsCard.entry = settingsCard.entry
     .replace(/^\s*Disable WTG Entirely:\s*(?:true|false)\s*$/gim, '')
     .replace(/^\s*Disable WTG:\s*(?:true|false)\s*$/gim, '')
+    .replace(/^\s*Enable Dynamic Time:\s*(?:true|false)\s*$/gim, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
@@ -1565,11 +1603,11 @@ function getTimeMultiplier() {
   const settingsCard = getWTGSettingsCard();
   if (!settingsCard || !settingsCard.entry) return 1.0;
 
-  const regex = /Time Duration Multiplier:\s*([\d.]+)/i;
+  const regex = /^\s*Time Duration Multiplier:\s*((?:\d+(?:\.\d*)?)|(?:\.\d+))\s*$/im;
   const match = settingsCard.entry.match(regex);
   if (match) {
     const value = parseFloat(match[1]);
-    return isNaN(value) ? 1.0 : value;
+    return Number.isFinite(value) && value > 0 ? value : 1.0;
   }
   return 1.0;
 }
@@ -1592,52 +1630,48 @@ function countPatternMatches(text, pattern) {
   return matches ? matches.length : 0;
 }
 
-function countQuotedSpeechCharacters(text) {
-  const quotedMatches = String(text || '').match(/"[^"]+"|'[^']+'/g);
-  return quotedMatches ? quotedMatches.join('').length : 0;
+function hasQuotedSpeech(text) {
+  return /"[^"]+"/.test(String(text || ''));
 }
 
 function countSpeakerLines(text) {
-  const internalLabels = /^(current date|current time|starting date|starting time|turn time|time duration multiplier|enable dynamic time|debug mode|wtg disabled|mode|category|conversation cap|base minutes|uncapped minutes|explicit minutes|similarity|confidence|last dynamic time estimate)$/i;
+  const internalLabels = /^(current date|current time|starting date|starting time|turn time|time duration multiplier|debug mode|wtg disabled|mode|category|conversation cap|semantic minutes|length baseline|length catch-up|uncapped minutes|explicit minutes|similarity|confidence|last dynamic time estimate)$/i;
   const lineRegex = /(?:^|\n)\s*([^:\n]{1,32}):\s*(?=\S)/g;
   let count = 0;
   let match;
 
   while ((match = lineRegex.exec(String(text || ''))) !== null) {
     const label = normalizeActionText(match[1]).toLowerCase();
-    if (!label || internalLabels.test(label)) continue;
+    if (!label || !/[a-z]/i.test(label) || /^(?:https?|ftp)$/i.test(label) || internalLabels.test(label)) continue;
     count++;
   }
 
   return count;
 }
 
-function hasConversationTimingContext(text, actionType = 'continue') {
-  if (actionType === 'say') return true;
-  const normalized = normalizeActionText(text);
-  if (!normalized) return false;
-
-  return getDialogueDensity(normalized, actionType) >= 0.25;
+function hasPastSpeechReference(text, actionType = 'continue') {
+  if (actionType === 'say') return false;
+  return /\b(said|asked|replied|answered|whispered|spoke|talked|chatted|conversed|argued|explained|muttered|shouted)\b/i.test(String(text || ''));
 }
 
-function getDialogueDensity(text, actionType = 'continue') {
-  if (actionType === 'say') return 1;
+function hasCurrentSpeechReference(text) {
+  return /\b(say|says|saying|ask|asks|asking|reply|replies|replying|answer|answers|answering|whisper|whispers|whispering|speak|speaks|speaking|talk|talks|talking|chat|chats|chatting|converse|converses|conversing|argue|argues|arguing|explain|explains|explaining|mutter|mutters|muttering|shout|shouts|shouting)\b/i.test(String(text || ''));
+}
 
-  const normalized = normalizeActionText(text);
-  if (!normalized) return 0;
+function hasPastSpeechMemoryContext(text, actionType = 'continue') {
+  if (!hasPastSpeechReference(text, actionType)) return false;
+  return !hasCurrentSpeechReference(text) && countSpeakerLines(text) === 0;
+}
 
-  const lower = normalized.toLowerCase();
-  const quotedRatio = countQuotedSpeechCharacters(normalized) / Math.max(normalized.length, 1);
-  const quoteMarks = countPatternMatches(normalized, /["']/g);
-  const speechVerbs = countPatternMatches(lower, /\b(say|ask|talk|whisper|reply|speak|chat|converse|argue|explain|answer|mutter|shout|call)\b/g);
-  const speakerLines = countSpeakerLines(normalized);
+function hasConversationTimingContext(text, actionType = 'continue') {
+  if (actionType === 'say') return true;
+  const rawText = String(text || '');
+  if (!normalizeActionText(rawText)) return false;
+  if (hasPastSpeechMemoryContext(rawText, actionType)) return false;
 
-  let density = quotedRatio;
-  if (quoteMarks >= 2) density += 0.2;
-  if (speechVerbs >= 2) density += 0.15;
-  if (speakerLines >= 2) density += Math.min(0.45, speakerLines * 0.25);
-
-  return clampNumber(density, 0, 1);
+  return hasQuotedSpeech(rawText) ||
+    countSpeakerLines(rawText) > 0 ||
+    hasCurrentSpeechReference(rawText);
 }
 
 function estimateConversationAutoMinutes(text, charsAfter = 0) {
@@ -1730,11 +1764,12 @@ function classifyDynamicTime(turnText, actionType = 'continue') {
   if (!lower && actionType === 'continue') {
     return {category: 'continue', score: 0};
   }
-  const dialogueDensity = getDialogueDensity(turnText, actionType);
   const conversationContext = hasConversationTimingContext(turnText, actionType);
+  if (conversationContext) {
+    return {category: 'dialogue', score: 4};
+  }
 
   const scores = {
-    dialogue: actionType === 'say' ? 2 : 0,
     combat: 0,
     perception: 0,
     exploration: 0,
@@ -1745,10 +1780,6 @@ function classifyDynamicTime(turnText, actionType = 'continue') {
     neutral: 0
   };
 
-  scores.dialogue += countPatternMatches(lower, /\b(say|ask|talk|whisper|reply|speak|chat|converse|argue|explain|laugh|cry|smile|frown|sigh|gasp|grin|smirk|nod|shrug|gesture)\b/g);
-  if (dialogueDensity >= 0.35) {
-    scores.dialogue += Math.max(2, Math.round(dialogueDensity * 5));
-  }
   scores.combat += countPatternMatches(lower, /\b(attack|fight|block|parry|dodge|slash|stab|shoot|strike|lunge|grapple|wrestle|reload|aim)\b/g) * 2;
   scores.perception += countPatternMatches(lower, /\b(look|glance|watch|listen|notice|realize|observe|hear|spot)\b/g);
   scores.exploration += countPatternMatches(lower, /\b(search|explore|inspect|investigate|track|follow|climb|descend|enter|open|unlock|examine|study|scout|map)\b/g) * 2;
@@ -1756,10 +1787,6 @@ function classifyDynamicTime(turnText, actionType = 'continue') {
   scores.travel += countPatternMatches(lower, /\b(travel|journey|trek|hike|march|ride|sail|fly|drive|cross|return|leave|arrive|reach|head|move|proceed|walk)\b/g) * 2;
   scores.waiting += countPatternMatches(lower, /\b(wait|rest|pause|linger|camp|relax|recover|keep watch|stand guard)\b/g) * 2;
   scores.transition += countPatternMatches(lower, /\b(later|afterward|afterwards|eventually|meanwhile|then|after that|before long|soon)\b/g);
-
-  if (conversationContext && scores.dialogue >= 2) {
-    return {category: 'dialogue', score: scores.dialogue};
-  }
 
   let bestCategory = 'neutral';
   let bestScore = scores.neutral;
@@ -1800,6 +1827,8 @@ function estimateDynamicElapsedTime(turnText, actionType = 'continue', charsAfte
       category,
       confidence: 1,
       explicitMinutes,
+      lengthMinutes: 0,
+      semanticMinutes: boundedExplicitMinutes,
       similarity: similarityClamped,
       charsAfter
     };
@@ -1833,13 +1862,11 @@ function estimateDynamicElapsedTime(turnText, actionType = 'continue', charsAfte
   const textLengthMinutes = category === 'dialogue'
     ? Math.min(0.55, normalizedText.length / 1800)
     : Math.min(1.5, normalizedText.length / 350);
-  const continuationMinutes = category === 'dialogue'
-    ? Math.min(actionType === 'continue' ? 0.45 : 0.2, charsAfter / 5000)
-    : actionType === 'continue'
-    ? Math.min(2.5, charsAfter / 1200)
-    : Math.min(1.2, charsAfter / 2400);
 
-  let rawMinutes = (categoryBaseMinutes[category] || 1) + textLengthMinutes + continuationMinutes;
+  const categoryBase = categoryBaseMinutes[category] !== undefined
+    ? categoryBaseMinutes[category]
+    : 1;
+  let rawMinutes = categoryBase + textLengthMinutes;
   if (category === 'dialogue') {
     rawMinutes = Math.min(rawMinutes, 1);
   }
@@ -1854,26 +1881,27 @@ function estimateDynamicElapsedTime(turnText, actionType = 'continue', charsAfte
   rawMinutes *= 1 + deterministicJitter(normalizedText || String(charsAfter), 0.08);
 
   const cap = Math.min(categoryCaps[category] || 2, WTG_DYNAMIC_MAX_AUTO_MINUTES);
-  const minutes = category === 'dialogue'
-    ? (rawMinutes < 0.9 ? 0 : 1)
+  const semanticMinutes = category === 'dialogue'
+    ? WTG_CONVERSATION_MAX_AUTO_MINUTES
     : (rawMinutes < 0.5 ? 0 : Math.round(clampNumber(rawMinutes, 0, cap)));
+  const lengthMinutes = category === 'dialogue'
+    ? 0
+    : Math.floor(Math.max(0, charsAfter) / 700);
+  const minutes = Math.max(
+    semanticMinutes,
+    Math.min(lengthMinutes, WTG_DYNAMIC_MAX_AUTO_MINUTES)
+  );
 
   return {
     minutes,
     category,
     confidence: clampNumber((classification.score || 0) / 4 + (normalizedText.length > 0 ? 0.25 : 0), 0.1, 0.95),
     explicitMinutes: 0,
+    lengthMinutes,
+    semanticMinutes,
     similarity: similarityClamped,
     charsAfter
   };
-}
-
-function estimateDynamicMinutes(turnText, actionType = 'do', similarity = 0.5) {
-  return estimateDynamicElapsedTime(turnText, actionType, 0, similarity).minutes;
-}
-
-function estimateContinuationMinutes(charsAfter = 0, similarity = 0.5) {
-  return estimateDynamicElapsedTime('', 'continue', charsAfter, similarity).minutes;
 }
 
 /**
@@ -1965,7 +1993,8 @@ function sanitizeSystemLeakage(outputText) {
 
   // Remove internal tags and explicit system command leakage.
   cleaned = cleaned.replace(/<scratchpad>[\s\S]*?<\/scratchpad>/gi, '');
-  cleaned = cleaned.replace(/\[(settime\s+[^\]]+|setcurrent\s+[^\]]+|advance\s+[^\]]+|reset|sleep)\]/gi, '');
+  cleaned = cleaned.replace(/\[(?:settime|setcurrent|advance)(?:\s+[^\]]*)?\]/gi, '');
+  cleaned = cleaned.replace(/\[(?:reset|sleep)\]/gi, '');
   cleaned = cleaned.replace(WTG_TURN_TIME_MARKER_REGEX, '');
 
   // Collapse any excess blank lines and edge whitespace that may result from cleanup.
@@ -1991,22 +2020,14 @@ function onInput_WTG(text) {
 
   // Check if WTG is completely disabled
   if (isWTGDisabled()) {
+    clearPendingPlayerInput();
+    delete state.wtgRetryGeneration;
     return text;
   }
 
-  // Only bootstrap default lightweight values once on first run.
-  // Preserves old behavior: fixed default date + randomly generated clock.
-  if (state.startingDate === undefined) {
-    state.startingDate = WTG_SCENE_START_DATE;
-    state.startingTime = getSceneDefaultStartTime();
-    state.currentDate = state.startingDate;
-    state.currentTime = state.startingTime;
-    state.turnTime = {years:0, months:0, days:0, hours:0, minutes:0, seconds:0};
-    state.settimeInitialized = true;
-  }
+  ensureClockStateInitialized();
 
   state.changed = state.changed || false;
-  state.insertMarker = false;
 
   let modifiedText = text;
   let messages = [];
@@ -2033,7 +2054,6 @@ function onInput_WTG(text) {
       const ttMarker = formatTurnTime(state.turnTime);
       messages.push(`\n\n[SYSTEM] You go to sleep and wake up on ${state.currentDate} at ${state.currentTime}. [[${ttMarker}]]\n\n`);
     }
-    state.insertMarker = true;
     state.changed = true;
     modifiedText = '';
   }
@@ -2071,17 +2091,17 @@ function onInput_WTG(text) {
             messages.push(`\n[SYSTEM] Starting date and time set to ${state.startingDate} ${state.startingTime}. [[${ttMarker}]]\n`);
             // Persist "explicit settime executed" state so other hooks can coordinate.
             markSettimeAsInitialized();
-            state.insertMarker = true;
+            writeTurnData([]);
             state.changed = true;
           }
         } else {
-          messages.push('[Invalid date. Use [settime mm/dd/yyyy h:mm AM/PM].');
+          messages.push('[Invalid date. Use command: settime mm/dd/yyyy h:mm AM/PM.]');
         }
       } else if (command === 'setcurrent') {
         let dateStr = parts[1];
         let timeStr = parts.slice(2).join(' ');
         if (!dateStr) {
-          messages.push('[Invalid date. Use [setcurrent mm/dd/yyyy [h:mm AM/PM]].');
+          messages.push('[Invalid date. Use command: setcurrent mm/dd/yyyy with an optional time.]');
         } else if (!state.startingDate || !state.startingTime || state.startingTime === 'Unknown' || !parseClockTime(state.startingTime)) {
           messages.push('[Current date/time cannot be recalculated until a numeric starting time exists. Use [settime mm/dd/yyyy h:mm AM/PM] first.]');
         } else {
@@ -2105,7 +2125,6 @@ function onInput_WTG(text) {
             const ttMarker = formatTurnTime(state.turnTime);
             messages.push(`\n\n[SYSTEM] Current date/time set to ${state.currentDate} ${state.currentTime}. Elapsed turn time recalculated from start: ${ttMarker}. [[${ttMarker}]]\n\n`);
             markSettimeAsInitialized();
-            state.insertMarker = true;
             state.changed = true;
           }
         }
@@ -2120,14 +2139,23 @@ function onInput_WTG(text) {
           } else {
             const add = parsedAdvance.add;
             if (add.years || add.months || add.days || add.hours || add.minutes) {
-              state.turnTime = addToTurnTime(state.turnTime, add);
-              const {currentDate, currentTime} = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
-              state.currentDate = currentDate;
-              state.currentTime = currentTime;
-              const ttMarker = formatTurnTime(state.turnTime);
-              messages.push(`\n\n[SYSTEM] Advanced ${parsedAdvance.summary}. New date/time: ${state.currentDate} ${state.currentTime}. [[${ttMarker}]]\n\n`);
-              state.insertMarker = true;
-              state.changed = true;
+              const current = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
+              const advanced = advanceDateTimeValue(current.currentDate, current.currentTime, add);
+              if (!advanced) {
+                messages.push('[Time advancement could not be calculated from the current date/time.]');
+              } else {
+                state.currentDate = advanced.date;
+                state.currentTime = advanced.time;
+                state.turnTime = getDateDiff(
+                  state.startingDate,
+                  state.startingTime,
+                  state.currentDate,
+                  state.currentTime
+                );
+                const ttMarker = formatTurnTime(state.turnTime);
+                messages.push(`\n\n[SYSTEM] Advanced ${parsedAdvance.summary}. New date/time: ${state.currentDate} ${state.currentTime}. [[${ttMarker}]]\n\n`);
+                state.changed = true;
+              }
             }
           }
         }
@@ -2156,7 +2184,6 @@ function onInput_WTG(text) {
         if (valid) {
           const ttMarker = formatTurnTime(state.turnTime);
           messages.push(`\n\n[SYSTEM] Date and time reset to most recent mention: ${state.currentDate} ${state.currentTime}. [[${ttMarker}]]\n\n`);
-          state.insertMarker = true;
           state.changed = true;
         } else {
           messages.push(`[No date or time mentions found in history.]`);
@@ -2191,8 +2218,12 @@ function onContext_WTG(text) {
 
   // Check if WTG is completely disabled
   if (isWTGDisabled()) {
+    clearPendingPlayerInput();
+    delete state.wtgRetryGeneration;
     return text;
   }
+
+  ensureClockStateInitialized();
 
   let modifiedText = text;
 
@@ -2200,23 +2231,35 @@ function onContext_WTG(text) {
   let turnData = getTurnData();
   const latestAction = getLatestPlayerAction(history);
   const timingAction = getTimingAction(history);
+  let historyRolledBack = false;
 
   // Only clean future turn data when history has clearly rolled back to a previously saved action.
   if (!hasPendingPlayerInput() && latestAction && turnData.length > 0) {
     const latestTurnData = getLatestTurnDataEntry(turnData);
-    const matchingEntry = findMatchingTurnDataEntry(latestAction, turnData);
-    if (
-      latestTurnData &&
-      matchingEntry &&
-      !isSameAction(latestTurnData.actionType, latestTurnData.actionText, latestAction.type, latestAction.text)
-    ) {
+    const matchingEntry = findMatchingTurnDataEntry(latestAction, turnData, history);
+    if (latestTurnData && !matchingEntry) {
+      writeTurnData([]);
+      turnData = [];
+      historyRolledBack = true;
+    } else if (latestTurnData && matchingEntry && matchingEntry !== latestTurnData) {
       cleanupWTGDataCardByTimestamp(parseTurnTime(matchingEntry.timestamp));
       turnData = getTurnData();
+      historyRolledBack = true;
     }
   }
 
   const currentTurnData = turnData;
-  const generationAlreadyTimed = state.wtgLastTimedGenerationCount === info.actionCount;
+  const retryGeneration = isRetryGeneration(history, currentTurnData);
+  if (retryGeneration) {
+    state.wtgRetryGeneration = true;
+  } else {
+    delete state.wtgRetryGeneration;
+  }
+  const generationAlreadyTimed = !hasPendingPlayerInput() && (
+    state.wtgLastTimedGenerationCount === info.actionCount ||
+    retryGeneration ||
+    historyRolledBack
+  );
 
   // Build keyword sets for dynamic time similarity calculation.
   let lastKeywords = [];
@@ -2230,43 +2273,93 @@ function onContext_WTG(text) {
     secondLastKeywords = extractKeywords(currentTurnData[currentTurnData.length - 2].actionText + " " + (currentTurnData[currentTurnData.length - 2].responseText || ''));
   }
 
-  // Follow the original WTG structure: compare this generation's visible context shape
-  // to the last two saved turns, while still allowing pending player input to influence factor selection.
+  // Compare only the text being timed with the two most recent saved turns.
   const recentHistoryTimingText = getRecentHistoryTextAfterLastTurnMarker(history);
   const currentTurnText = hasPendingPlayerInput()
     ? state.wtgPendingPlayerInputRaw
     : (recentHistoryTimingText || modifiedText);
-  const conversationTimingActionType = timingAction ? timingAction.type : 'continue';
-  const conversationTimingContext = hasConversationTimingContext(currentTurnText, conversationTimingActionType);
-  const currentKeywords = extractKeywords(modifiedText);
+  const timingActionType = hasPendingPlayerInput() && timingAction ? timingAction.type : 'continue';
+  const memoryTimingContext = hasPastSpeechMemoryContext(currentTurnText, timingActionType);
+  const conversationTimingContext = hasConversationTimingContext(currentTurnText, timingActionType);
+  const currentKeywords = extractKeywords(currentTurnText);
 
   // Calculate similarity with the two most recent turns
   const similarity1 = calculateKeywordSimilarity(lastKeywords, currentKeywords);
   const similarity2 = calculateKeywordSimilarity(secondLastKeywords, currentKeywords);
 
-  // Store similarity for onOutput_WTG to use (key for two-layer dynamic time merging)
+  // Store similarity for the current estimate and Debug card.
   state.wtgSimilarity = Math.max(similarity1, similarity2);
 
   // Recover the most recent authoritative turn marker and count characters after it.
   const {lastTT, charsAfter, found: markerFound} = getLastTurnTimeAndChars(history);
+  const persistedTT = getLastTimestampFromWTGData();
+  let baseTT = normalizeTurnTimeSign(state.turnTime);
+
+  if (historyRolledBack) {
+    baseTT = persistedTT || (markerFound
+      ? lastTT
+      : {years:0, months:0, days:0, hours:0, minutes:0, seconds:0});
+  } else {
+    if (persistedTT && compareTurnTime(persistedTT, baseTT) > 0) {
+      baseTT = persistedTT;
+    }
+    if (markerFound && compareTurnTime(lastTT, baseTT) > 0) {
+      baseTT = lastTT;
+    }
+  }
 
   // Check if lastTT came from the most recent action (usually means it came from a user command).
   // If the last action ends with a precise [[turntime]], trust that marker instead of continuing to accumulate time.
   let useLastTTDirectly = false;
   if (history.length > 0) {
-    const lastActionText = history[history.length - 1].text;
-    if (lastActionText.match(/\[\[(-?\d+y\d+m\d+d\d+h\d+n\d+s)\]\]$/)) {
+    const lastActionText = String(history[history.length - 1] && history[history.length - 1].text || '');
+    if (lastActionText.match(/\[\[(-?\d+y\d+m\d+d\d+h\d+n\d+s)\]\]\s*$/)) {
       useLastTTDirectly = true;
     }
   }
 
   let additionalMinutes = 0;
-  const timingActionType = hasPendingPlayerInput() && timingAction ? timingAction.type : 'continue';
-  const dynamicEnabled = getWTGBooleanSetting("Enable Dynamic Time");
   const timeMultiplier = getTimeMultiplier();
   const estimateAutomaticMinutes = () => {
+    const explicitMinutes = extractExplicitDurationMinutes(currentTurnText);
+    if (explicitMinutes > 0) {
+      const baseMinutes = Math.min(explicitMinutes, WTG_DYNAMIC_MAX_EXPLICIT_MINUTES);
+      const minutes = Math.floor(baseMinutes * timeMultiplier);
+      state.wtgLastDynamicEstimate = {
+        mode: 'explicit',
+        category: 'explicit',
+        minutes,
+        uncappedMinutes: minutes,
+        conversationContext: false,
+        baseMinutes,
+        lengthMinutes: 0,
+        lengthCatchupMinutes: 0,
+        explicitMinutes,
+        similarity: state.wtgSimilarity,
+        confidence: 1
+      };
+      return minutes;
+    }
+
+    if (memoryTimingContext) {
+      state.wtgLastDynamicEstimate = {
+        mode: 'memory',
+        category: 'past-dialogue',
+        minutes: 0,
+        uncappedMinutes: 0,
+        conversationContext: false,
+        baseMinutes: 0,
+        lengthMinutes: 0,
+        lengthCatchupMinutes: 0,
+        explicitMinutes: 0,
+        similarity: state.wtgSimilarity,
+        confidence: 0.95
+      };
+      return 0;
+    }
+
     if (conversationTimingContext) {
-      const minutes = estimateConversationAutoMinutes(currentTurnText, charsAfter, timeMultiplier);
+      const minutes = estimateConversationAutoMinutes(currentTurnText, charsAfter);
       state.wtgLastDynamicEstimate = {
         mode: 'conversation',
         category: 'dialogue',
@@ -2274,56 +2367,43 @@ function onContext_WTG(text) {
         uncappedMinutes: minutes,
         conversationContext: true,
         baseMinutes: minutes,
-        explicitMinutes: extractExplicitDurationMinutes(currentTurnText),
+        lengthMinutes: 0,
+        lengthCatchupMinutes: 0,
+        explicitMinutes: 0,
         similarity: state.wtgSimilarity,
         confidence: 0.95
       };
       return minutes;
     }
 
-    if (dynamicEnabled) {
-      const estimate = estimateDynamicElapsedTime(currentTurnText, timingActionType, charsAfter, state.wtgSimilarity);
-      const shouldCapAsConversation = estimate.category === 'dialogue';
-      const uncappedMinutes = Math.floor(estimate.minutes * timeMultiplier);
-      const minutes = shouldCapAsConversation
-        ? Math.min(uncappedMinutes, WTG_CONVERSATION_MAX_AUTO_MINUTES)
-        : uncappedMinutes;
-      state.wtgLastDynamicEstimate = {
-        mode: 'dynamic',
-        category: estimate.category,
-        minutes,
-        uncappedMinutes,
-        conversationContext: shouldCapAsConversation,
-        baseMinutes: estimate.minutes,
-        explicitMinutes: estimate.explicitMinutes,
-        similarity: estimate.similarity,
-        confidence: estimate.confidence
-      };
-      return minutes;
-    }
-
-    const uncappedMinutes = Math.floor((charsAfter / 700) * timeMultiplier);
-    const minutes = uncappedMinutes;
+    const estimate = estimateDynamicElapsedTime(currentTurnText, timingActionType, charsAfter, state.wtgSimilarity);
+    const semanticMinutes = Math.floor(estimate.semanticMinutes * timeMultiplier);
+    const lengthTargetMinutes = Math.floor(estimate.lengthMinutes * timeMultiplier);
+    const elapsedSinceBaseline = markerFound
+      ? Math.max(0, getElapsedMinutesBetweenTurnTimes(lastTT, baseTT))
+      : 0;
+    const lengthCatchupMinutes = Math.max(0, lengthTargetMinutes - elapsedSinceBaseline);
+    const uncappedMinutes = Math.max(semanticMinutes, lengthCatchupMinutes);
+    const minutes = Math.min(uncappedMinutes, WTG_DYNAMIC_MAX_AUTO_MINUTES);
     state.wtgLastDynamicEstimate = {
-      mode: 'length',
-      category: 'length',
+      mode: 'dynamic',
+      category: estimate.category,
       minutes,
       uncappedMinutes,
-      conversationContext: conversationTimingContext,
-      baseMinutes: uncappedMinutes,
-      explicitMinutes: 0,
-      similarity: state.wtgSimilarity,
-      confidence: 0.4
+      conversationContext: false,
+      baseMinutes: estimate.semanticMinutes,
+      lengthMinutes: estimate.lengthMinutes,
+      lengthCatchupMinutes,
+      explicitMinutes: estimate.explicitMinutes,
+      similarity: estimate.similarity,
+      confidence: estimate.confidence
     };
     return minutes;
   };
 
   if (generationAlreadyTimed) {
-    // Retry regenerates within the same actionCount cycle and must not advance time twice.
-    state.turnTime = lastTT;
-    const {currentDate, currentTime} = computeCurrent(state.startingDate || WTG_SCENE_START_DATE, state.startingTime || 'Unknown', state.turnTime);
-    state.currentDate = currentDate;
-    state.currentTime = currentTime;
+    // Repeated context calls and retries must preserve the latest confirmed time.
+    state.turnTime = baseTT;
   } else if (useLastTTDirectly) {
     // If the most recent action already ends with a precise [[turntime]],
     // trust that marker and don't append elapsed time here.
@@ -2332,34 +2412,24 @@ function onContext_WTG(text) {
     state.currentDate = currentDate;
     state.currentTime = currentTime;
     state.changed = true;
-  } else if (markerFound) {
+  } else {
     additionalMinutes = estimateAutomaticMinutes();
 
-    // Update turn time
     if (additionalMinutes > 0) {
-      state.turnTime = addToTurnTime(lastTT, {minutes: additionalMinutes});
+      state.turnTime = addToTurnTime(baseTT, {minutes: additionalMinutes});
       state.changed = true;
     } else {
-      state.turnTime = lastTT;
+      state.turnTime = baseTT;
     }
-    const {currentDate, currentTime} = computeCurrent(state.startingDate || WTG_SCENE_START_DATE, state.startingTime || 'Unknown', state.turnTime);
-    state.currentDate = currentDate;
-    state.currentTime = currentTime;
-  } else {
-    // No marker remains; preserve original lightweight fallback using in-memory turnTime.
-    if (state.turnTime && state.startingTime !== 'Unknown' && parseClockTime(state.startingTime)) {
-      additionalMinutes = estimateAutomaticMinutes();
-
-      if (additionalMinutes > 0) {
-        state.turnTime = addToTurnTime(state.turnTime, {minutes: additionalMinutes});
-        const {currentDate, currentTime} = computeCurrent(state.startingDate || WTG_SCENE_START_DATE, state.startingTime || 'Unknown', state.turnTime);
-        state.currentDate = currentDate;
-        state.currentTime = currentTime;
-        state.changed = true;
-      }
-    }
-    // If state.turnTime doesn't exist, keep currentDate/currentTime unchanged
   }
+
+  const {currentDate, currentTime} = computeCurrent(
+    state.startingDate || WTG_SCENE_START_DATE,
+    state.startingTime || 'Unknown',
+    state.turnTime
+  );
+  state.currentDate = currentDate;
+  state.currentTime = currentTime;
 
   state.wtgLastTimedGenerationCount = info.actionCount;
 
@@ -2370,14 +2440,11 @@ function onContext_WTG(text) {
   cleanupStoryCardsByTimestamp(state.currentDate, state.currentTime);
   updateWTGDebugCard();
 
-  state.insertMarker = (charsAfter >= 7000);
-
   let instructions = `\nDo not recreate or reference any system commands such as [settime], [setcurrent], [advance], [reset], or [sleep]. Keep scene chronology consistent with the hidden current date/time below. Do not expose system metadata, and only mention exact time when the narrative naturally requires it.`;
 
   modifiedText += instructions;
 
-  // Only inject visible current date/time into context after explicit [settime] has been established.
-  // Default random start time is also a valid clock, so decide based on current initialization state.
+  // Inject current date/time once either the default or an explicit clock is initialized.
   let dateTimeInjection = '';
   if (hasSettimeBeenInitialized() && state.currentTime !== 'Unknown') {
     dateTimeInjection = `\nCurrent date: ${state.currentDate}; Current time: ${state.currentTime}`;
@@ -2401,8 +2468,12 @@ function onOutput_WTG(text) {
 
   // Check if WTG is completely disabled
   if (isWTGDisabled()) {
-    return ensureLeadingSpace(text);
+    clearPendingPlayerInput();
+    delete state.wtgRetryGeneration;
+    return text;
   }
+
+  ensureClockStateInitialized();
 
   // If state lost the settime initialized flag, recover from persisted lightweight data.
   if (!state.settimeInitialized) {
@@ -2438,6 +2509,7 @@ function onOutput_WTG(text) {
 
             // Since this is auto-detected [settime], mark as initialized here
             markSettimeAsInitialized();
+            writeTurnData([]);
 
             // Initialize required system storycards
             updateDateTimeCard();
@@ -2469,15 +2541,15 @@ function onOutput_WTG(text) {
     }
   }
   const pendingInputMatchesLastAction = hasPendingPlayerInput() && lastAction && normalizeActionText(lastAction.text) === state.wtgPendingPlayerInputText;
-  const generationAlreadyLogged = state.wtgLastLoggedGenerationCount === info.actionCount;
-  const ttMatch = modifiedText.match(/\[\[(.*?)\]\]$/);
+  const ttMatch = modifiedText.match(/\[\[(-?\d+y\d+m\d+d\d+h\d+n\d+s)\]\]\s*$/);
   let parsedTT = ttMatch ? parseTurnTime(ttMatch[1]) : null;
-  let narrative = ttMatch ? modifiedText.replace(/\[\[.*\]\]$/, '').trim() : modifiedText.trim();
+  let narrative = ttMatch
+    ? modifiedText.replace(/\[\[-?\d+y\d+m\d+d\d+h\d+n\d+s\]\]\s*$/, '').trim()
+    : modifiedText.trim();
 
   if (parsedTT) {
-    const currentTTForm = formatTurnTime(state.turnTime);
-    if (ttMatch[1] !== currentTTForm) {
-      modifiedText += '\n[Warning: Turn time metadata altered by AI. Please retry.]';
+    if (compareTurnTime(parsedTT, state.turnTime) !== 0) {
+      narrative += '\n[Warning: Turn time metadata altered by AI. Please retry.]';
     }
   }
 
@@ -2501,13 +2573,13 @@ function onOutput_WTG(text) {
   }
 
   // Store turn data for subsequent reconstruction and erase cleanup.
-  if (lastAction && pendingInputMatchesLastAction && actionType !== "continue") {
+  if (lastAction && state.wtgRetryGeneration && actionType !== "continue") {
+    upsertLatestTurnData(actionType, lastAction.text, narrative, formatTurnTime(state.turnTime));
+    rememberProcessedAction(lastAction);
+    delete state.wtgRetryGeneration;
+  } else if (lastAction && pendingInputMatchesLastAction && actionType !== "continue") {
     const timestamp = formatTurnTime(state.turnTime);
-    if (generationAlreadyLogged) {
-      upsertLatestTurnData(actionType, lastAction.text, narrative, timestamp);
-    } else {
-      addTurnData(actionType, lastAction.text, narrative, timestamp);
-    }
+    addTurnData(actionType, lastAction.text, narrative, timestamp);
     rememberProcessedAction(lastAction);
     state.wtgLastLoggedGenerationCount = info.actionCount;
   }
@@ -2521,8 +2593,6 @@ function onOutput_WTG(text) {
     updateDateTimeCard();
     delete state.changed;
   }
-
-  delete state.insertMarker;
 
   // Before final visible output, sanitize accidental system time and system command leakage.
   modifiedText = sanitizeSystemLeakage(modifiedText);

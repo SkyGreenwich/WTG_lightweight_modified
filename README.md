@@ -104,31 +104,35 @@ Configure via the "World Time Generator Settings" storycard:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Time Duration Multiplier | 1.0 | Scales automatic elapsed time. |
-| Enable Dynamic Time | true | Uses semantic action timing instead of pure character count. |
+| Time Duration Multiplier | 1.0 | Positive number that scales ordinary and explicit automatic elapsed time. |
 | Debug Mode | false | Shows the latest dynamic-time estimate in a separate `WTG Debug` system storycard. |
 | WTG Disabled | false | Stops WTG processing while leaving the scripts installed. |
 
-Older settings named `Disable WTG Entirely` or `Disable WTG` are automatically migrated to `WTG Disabled`.
+Older settings named `Disable WTG Entirely` or `Disable WTG` are automatically migrated to `WTG Disabled`. The retired `Enable Dynamic Time` setting is removed automatically.
 
 ---
 
-## Dynamic Time Mode
+## Automatic Time Calculation
 
-Dynamic Time is intentionally conservative. It estimates small turn-by-turn elapsed time so the clock feels alive without letting ordinary actions jump ahead by tens of minutes. Large deliberate jumps should use `[advance]`, `[sleep]`, or `[setcurrent]`.
+WTG always uses semantic dynamic-time calculation. It estimates small turn-by-turn elapsed time so the clock feels alive without letting ordinary actions jump ahead by tens of minutes. Large deliberate jumps should use `[advance]`, `[sleep]`, or `[setcurrent]`.
+
+For ordinary actions, WTG calculates a semantic per-turn estimate and a cumulative character target of one minute per 700 characters since the latest time marker. It subtracts time already elapsed from that character target and only applies the missing catch-up amount. The larger of the semantic estimate and the catch-up amount is used, so long passages are not underestimated and old characters are not counted repeatedly.
 
 It classifies the current turn:
 
-- **Dialogue**: Uses a dedicated slow conversation branch, advancing 1 minute per detected exchange.
+- **Dialogue**: A `say` action, quoted speech, a speaker-prefixed line, or a present-tense speech verb advances exactly 1 minute.
+- **Past dialogue**: Past-tense speech references such as `said`, `asked`, or `replied` are treated as memory and advance 0 minutes when no duration is stated.
 - **Combat/Perception**: Usually 1-2 minutes.
 - **Exploration**: Usually 1-3 minutes.
 - **Work/Preparation**: Usually 2-4 minutes.
 - **Travel/Waiting**: Usually 2-5 minutes.
-- **Continue**: Uses accumulated response length, capped at 3 minutes.
+- **Continue**: Its semantic estimate is capped at 3 minutes; character catch-up can still raise the final ordinary estimate.
 
-Explicit duration phrases are treated as hints, not absolute authority, and are capped at 10 minutes by default. For example, "wait for two hours" records the explicit duration for debug visibility but only advances a conservative amount unless you use `[advance 2 hours]`.
+Explicit duration phrases take priority over dialogue and memory detection. They are treated as hints, not absolute authority, and are capped at 10 base minutes by default. For example, "they talked for two hours" advances 10 base minutes unless you use `[advance 2 hours]`.
 
-Similarity to recent turns dampens repeated scenes. `Time Duration Multiplier` scales the final result.
+Similarity between the current timed text and the two most recent recorded turns dampens repeated scenes. `Time Duration Multiplier` is applied after semantic and character estimates are calculated. Dialogue remains fixed at 1 minute and past-dialogue memory remains fixed at 0 minutes.
+
+Non-explicit estimates remain capped at 6 minutes per generation after the multiplier is applied. Invalid or non-positive multiplier values fall back to `1.0`.
 
 ---
 

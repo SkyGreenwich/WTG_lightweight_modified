@@ -35,8 +35,8 @@ WTG Lightweight Modified is a time tracking script for AI Dungeon based on WTG 2
 
 - **library.js**: Core functions and WTG logic
 - **Input.js**: Processes player input and commands
-- **Context.js**: Calculates time passage and adds time context
-- **Output.js**: Records turns and timestamps storycards
+- **Context.js**: Reconstructs the clock and adds time context
+- **Output.js**: Calculates time passage, records turns, and timestamps storycards
 
 ---
 

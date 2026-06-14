@@ -671,12 +671,13 @@ function getComparableTurnTimeValue(tt) {
 }
 
 function normalizeTurnDataRecord(record) {
+  const rawVersion = Number(record && record.version);
   const rawActionCount = record && record.actionCount;
   const actionCount = rawActionCount === null || rawActionCount === undefined
     ? NaN
     : Number(rawActionCount);
   return {
-    version: 3,
+    version: Number.isInteger(rawVersion) && rawVersion >= 4 ? rawVersion : 3,
     actionCount: Number.isInteger(actionCount) && actionCount >= 0 ? actionCount : null,
     actionType: String(record && record.actionType || ''),
     actionText: String(record && record.actionText || ''),
@@ -768,23 +769,22 @@ function addTurnData(actionType, actionText, responseText, timestamp) {
   const actionCount = typeof info !== 'undefined' && info && Number.isInteger(info.actionCount)
     ? info.actionCount
     : null;
-  const entry = serializeTurnDataRecord({actionCount, actionType, actionText, responseText, timestamp});
+  const record = normalizeTurnDataRecord({
+    version: 4,
+    actionCount,
+    actionType,
+    actionText,
+    responseText,
+    timestamp
+  });
+
+  const entry = serializeTurnDataRecord(record);
 
   if (dataCard.entry && dataCard.entry.trim()) {
     dataCard.entry += '\n' + entry;
   } else {
     dataCard.entry = entry;
   }
-}
-
-/**
- * Gets the most recent turn data entry.
- * @param {Array} turnData - Array returned by getTurnData()
- * @returns {Object|null} Most recent entry; null if none exists
- */
-function getLatestTurnDataEntry(turnData) {
-  if (!turnData || turnData.length === 0) return null;
-  return turnData[turnData.length - 1];
 }
 
 /**
@@ -815,18 +815,6 @@ function normalizeActionText(text) {
     .trim();
 }
 
-/**
- * Checks whether two player actions should be treated as the same action for timing purposes.
- * @param {string} typeA - First action type
- * @param {string} textA - First action text
- * @param {string} typeB - Second action type
- * @param {string} textB - Second action text
- * @returns {boolean} True if the actions are equivalent
- */
-function isSameAction(typeA, textA, typeB, textB) {
-  return typeA === typeB && normalizeActionText(textA) === normalizeActionText(textB);
-}
-
 function getHostActionType(fallback = 'continue') {
   if (typeof info !== 'undefined' && info) {
     if (info.isContinue === true) return 'continue';
@@ -836,37 +824,6 @@ function getHostActionType(fallback = 'continue') {
     }
   }
   return fallback;
-}
-
-function isGeneratedOutputStillPresentInHistory(historyItems, outputText) {
-  const normalizedOutput = normalizeActionText(outputText);
-  if (!normalizedOutput) return false;
-
-  const probeLength = Math.min(160, normalizedOutput.length);
-  const probe = normalizedOutput.slice(0, probeLength);
-  return (historyItems || []).slice(-8).some(item =>
-    normalizeActionText(item && item.text).includes(probe)
-  );
-}
-
-function isRetryGeneration(historyItems = history) {
-  if (hasPendingPlayerInput()) return false;
-
-  const previousOutput = state.wtgLastGeneratedOutput;
-  return Boolean(
-    previousOutput &&
-    !isGeneratedOutputStillPresentInHistory(historyItems, previousOutput)
-  );
-}
-
-function rememberGeneratedOutput(outputText, wasContinue) {
-  const normalizedOutput = normalizeActionText(outputText);
-  if (normalizedOutput) {
-    state.wtgLastGeneratedOutput = normalizedOutput;
-  } else {
-    delete state.wtgLastGeneratedOutput;
-  }
-  state.wtgLastGenerationWasContinue = Boolean(wasContinue);
 }
 
 /**
@@ -906,108 +863,79 @@ function hasFreshPendingPlayerInput() {
 }
 
 /**
- * Finds the persisted occurrence corresponding to the current history position.
- * @param {Object|null} action - Most recent player action
- * @param {Array} turnData - Array returned by getTurnData()
- * @param {Array} historyItems - Current history
- * @returns {Object|null} Matching entry and index; null if none exists
+ * Finds the newest persisted AI output that is still present in history.
+ * Player actions cannot anchor Continue generations, so rewind recovery is
+ * based on the visible output text that AI Dungeon actually retained.
  */
-function findMatchingTurnDataEntry(action, turnData, historyItems = []) {
-  if (!action || !turnData || turnData.length === 0) return null;
+function findLatestTurnDataEntryInHistory(turnData, historyItems = []) {
+  if (!Array.isArray(turnData) || turnData.length === 0) return null;
 
-  const currentActionCount = typeof info !== 'undefined' && info && Number.isInteger(info.actionCount)
-    ? info.actionCount
-    : null;
-  if (currentActionCount !== null) {
-    for (let i = turnData.length - 1; i >= 0; i--) {
-      const entry = turnData[i];
-      if (
-        entry.actionCount === currentActionCount &&
-        isSameAction(entry.actionType, entry.actionText, action.type, action.text)
-      ) {
-        return {entry, index: i};
-      }
-    }
-  }
+  const historyTexts = (historyItems || [])
+    .map(item => normalizeActionText(item && item.text))
+    .filter(Boolean);
+  if (historyTexts.length === 0) return null;
 
-  const historyActions = (historyItems || []).filter(item =>
-    item && (item.type === 'do' || item.type === 'say' || item.type === 'story')
-  );
   let bestMatch = null;
-  let bestSequenceLength = -1;
 
   for (let i = turnData.length - 1; i >= 0; i--) {
-    const entry = turnData[i];
-    if (!isSameAction(entry.actionType, entry.actionText, action.type, action.text)) {
-      continue;
-    }
+    if (turnData[i].version < 4) continue;
+    const responseText = normalizeActionText(turnData[i].responseText);
+    if (!responseText) continue;
 
-    let historyIndex = historyActions.length - 1;
-    let turnDataIndex = i;
-    let sequenceLength = 0;
-    while (historyIndex >= 0 && turnDataIndex >= 0) {
-      const historyAction = historyActions[historyIndex];
-      const turnRecord = turnData[turnDataIndex];
-      if (!isSameAction(
-        turnRecord.actionType,
-        turnRecord.actionText,
-        historyAction.type,
-        historyAction.text
-      )) {
-        break;
+    for (let historyIndex = historyTexts.length - 1; historyIndex >= 0; historyIndex--) {
+      if (historyTexts[historyIndex] !== responseText) continue;
+
+      let sequenceLength = 1;
+      let recordIndex = i - 1;
+      let previousHistoryIndex = historyIndex - 1;
+
+      while (recordIndex >= 0 && previousHistoryIndex >= 0) {
+        if (turnData[recordIndex].version < 4) {
+          recordIndex--;
+          continue;
+        }
+        const previousResponse = normalizeActionText(turnData[recordIndex].responseText);
+        if (!previousResponse) {
+          recordIndex--;
+          continue;
+        }
+
+        while (
+          previousHistoryIndex >= 0 &&
+          historyTexts[previousHistoryIndex] !== previousResponse
+        ) {
+          previousHistoryIndex--;
+        }
+        if (previousHistoryIndex < 0) break;
+
+        sequenceLength++;
+        recordIndex--;
+        previousHistoryIndex--;
       }
-      sequenceLength++;
-      historyIndex--;
-      turnDataIndex--;
-    }
 
-    if (sequenceLength > bestSequenceLength) {
-      bestMatch = {entry, index: i};
-      bestSequenceLength = sequenceLength;
+      if (
+        !bestMatch ||
+        sequenceLength > bestMatch.sequenceLength ||
+        (
+          sequenceLength === bestMatch.sequenceLength &&
+          i < bestMatch.index
+        )
+      ) {
+        bestMatch = {
+          entry: turnData[i],
+          index: i,
+          sequenceLength
+        };
+      }
     }
   }
+
   return bestMatch;
 }
 
 function trimTurnDataAfterIndex(turnData, index) {
   if (!Array.isArray(turnData) || index < 0 || index >= turnData.length) return;
   writeTurnData(turnData.slice(0, index + 1));
-}
-
-/**
- * In retry scenarios, overwrites the last turn data entry with the new AI response
- * rather than appending a duplicate.
- * If the last entry doesn't match the current action, falls back to normal append.
- * @param {string} actionType - Action type
- * @param {string} actionText - Player action text
- * @param {string} responseText - AI response text
- * @param {string} timestamp - Turntime-formatted timestamp
- */
-function upsertLatestTurnData(actionType, actionText, responseText, timestamp) {
-  const records = getTurnData();
-  const actionCount = typeof info !== 'undefined' && info && Number.isInteger(info.actionCount)
-    ? info.actionCount
-    : null;
-
-  if (records.length === 0) {
-    addTurnData(actionType, actionText, responseText, timestamp);
-    return;
-  }
-
-  const lastRecord = records[records.length - 1];
-  if (!isSameAction(lastRecord.actionType, lastRecord.actionText, actionType, actionText)) {
-    addTurnData(actionType, actionText, responseText, timestamp);
-    return;
-  }
-
-  records[records.length - 1] = normalizeTurnDataRecord({
-    actionCount,
-    actionType,
-    actionText,
-    responseText,
-    timestamp
-  });
-  writeTurnData(records);
 }
 
 /**
@@ -1117,8 +1045,7 @@ function getDateDiff(startStr, startTimeStr, endStr, endTimeStr) {
 }
 
 /**
- * Gets the most recent timestamp from the WTG Data storycard
- * @returns {Object|null} Most recent turn time object, or null if not found
+ * Gets the most recent timestamp from the WTG Data storycard.
  */
 function getLastTimestampFromWTGData() {
   const records = getTurnData();
@@ -1133,7 +1060,7 @@ function getLastTimestampFromWTGData() {
 }
 
 /**
- * Gets the most recent turn time marker from history or persisted turn data.
+ * Gets the most recent turn time marker from history.
  */
 function getLastTurnTime(historyItems) {
   let lastTT = {years:0, months:0, days:0, hours:0, minutes:0, seconds:0};
@@ -1153,13 +1080,6 @@ function getLastTurnTime(historyItems) {
     }
   }
 
-  if (!found) {
-    const wtgDataTimestamp = getLastTimestampFromWTGData();
-    if (wtgDataTimestamp) {
-      lastTT = wtgDataTimestamp;
-      found = true;
-    }
-  }
   return {lastTT, found};
 }
 
@@ -1916,7 +1836,6 @@ function onInput_WTG(text) {
   // Check if WTG is completely disabled
   if (isWTGDisabled()) {
     clearPendingPlayerInput();
-    delete state.wtgRetryGeneration;
     return text;
   }
 
@@ -2122,7 +2041,6 @@ function onContext_WTG(text) {
   // Check if WTG is completely disabled
   if (isWTGDisabled()) {
     clearPendingPlayerInput();
-    delete state.wtgRetryGeneration;
     return text;
   }
 
@@ -2132,52 +2050,49 @@ function onContext_WTG(text) {
 
   // Read lightweight turn log for reconstructing history and recovering from erase states.
   let turnData = getTurnData();
-  const latestAction = getLatestPlayerAction(history);
   let historyRolledBack = false;
+  let rollbackTurnTime = null;
 
-  // Only clean future turn data when history has clearly rolled back to a previously saved action.
-  if (!hasPendingPlayerInput() && latestAction && turnData.length > 0) {
-    const latestTurnData = getLatestTurnDataEntry(turnData);
-    const matchingTurn = findMatchingTurnDataEntry(latestAction, turnData, history);
-    if (latestTurnData && !matchingTurn) {
-      writeTurnData([]);
-      turnData = [];
+  // Every saved AI output is a timeline anchor, including Continue generations.
+  // If the newest saved output no longer exists in history, restore the newest
+  // retained output timestamp and remove the erased branch from WTG Data.
+  const firstRewindAnchorIndex = turnData.findIndex(record =>
+    record.version >= 4 && normalizeActionText(record.responseText)
+  );
+  const lastRewindAnchorIndex = (() => {
+    for (let i = turnData.length - 1; i >= 0; i--) {
+      if (turnData[i].version >= 4 && normalizeActionText(turnData[i].responseText)) {
+        return i;
+      }
+    }
+    return -1;
+  })();
+  if (lastRewindAnchorIndex >= 0) {
+    const matchingTurn = findLatestTurnDataEntryInHistory(turnData, history);
+    if (!matchingTurn) {
+      writeTurnData(turnData.slice(0, firstRewindAnchorIndex));
+      turnData = getTurnData();
+      rollbackTurnTime = getLastTimestampFromWTGData();
       historyRolledBack = true;
-    } else if (latestTurnData && matchingTurn && matchingTurn.index !== turnData.length - 1) {
+    } else if (matchingTurn.index !== lastRewindAnchorIndex) {
       trimTurnDataAfterIndex(turnData, matchingTurn.index);
       turnData = getTurnData();
+      rollbackTurnTime = getLastTimestampFromWTGData();
       historyRolledBack = true;
     }
   }
   if (historyRolledBack) {
     clearDynamicMinuteRemainder();
-    delete state.wtgLastGeneratedOutput;
-    delete state.wtgLastGenerationWasContinue;
   }
 
-  const retryGeneration = isRetryGeneration();
-  if (retryGeneration) {
-    state.wtgRetryGeneration = true;
-  } else {
-    delete state.wtgRetryGeneration;
-  }
-
-  // Recover the most recent authoritative turn marker.
+  // The host-managed state is the authoritative running clock.
+  // Storycard data may still contain entries from the erased future.
   const {lastTT, found: markerFound} = getLastTurnTime(history);
-  const persistedTT = getLastTimestampFromWTGData();
   let baseTT = normalizeTurnTimeSign(state.turnTime);
-
   if (historyRolledBack) {
-    baseTT = persistedTT || (markerFound
+    baseTT = rollbackTurnTime || (markerFound
       ? lastTT
       : {years:0, months:0, days:0, hours:0, minutes:0, seconds:0});
-  } else {
-    if (persistedTT && compareTurnTime(persistedTT, baseTT) > 0) {
-      baseTT = persistedTT;
-    }
-    if (markerFound && compareTurnTime(lastTT, baseTT) > 0) {
-      baseTT = lastTT;
-    }
   }
 
   // Check if lastTT came from the most recent action (usually means it came from a user command).
@@ -2190,9 +2105,7 @@ function onContext_WTG(text) {
     }
   }
 
-  if (historyRolledBack) {
-    state.turnTime = baseTT;
-  } else if (useLastTTDirectly) {
+  if (useLastTTDirectly && markerFound) {
     // If the most recent action already ends with a precise [[turntime]],
     // trust that marker and don't append elapsed time here.
     state.turnTime = lastTT;
@@ -2203,6 +2116,9 @@ function onContext_WTG(text) {
     state.changed = true;
   } else {
     state.turnTime = baseTT;
+  }
+  if (historyRolledBack) {
+    state.changed = true;
   }
 
   const {currentDate, currentTime} = computeCurrent(
@@ -2249,7 +2165,6 @@ function onOutput_WTG(text) {
   // Check if WTG is completely disabled
   if (isWTGDisabled()) {
     clearPendingPlayerInput();
-    delete state.wtgRetryGeneration;
     return text;
   }
 
@@ -2324,7 +2239,6 @@ function onOutput_WTG(text) {
   actionType = getHostActionType(actionType);
   const pendingPlayerInput = hasPendingPlayerInput();
   const freshPendingPlayerInput = hasFreshPendingPlayerInput();
-  const pendingInputMatchesLastAction = pendingPlayerInput && lastAction && normalizeActionText(lastAction.text) === state.wtgPendingPlayerInputText;
   const ttMatch = modifiedText.match(/\[\[(-?\d+y\d+m\d+d\d+h\d+n\d+s)\]\]\s*$/);
   let parsedTT = ttMatch ? parseTurnTime(ttMatch[1]) : null;
   let narrative = ttMatch
@@ -2339,23 +2253,18 @@ function onOutput_WTG(text) {
 
   modifiedText = narrative;
 
-  const retryGeneration = isRetryGeneration(history) || Boolean(state.wtgRetryGeneration);
   const skipAutomaticTiming = Boolean(state.wtgSkipNextAutomaticTiming);
-  const retryingContinue = retryGeneration && Boolean(state.wtgLastGenerationWasContinue);
   const timingActionType = pendingPlayerInput
     ? (state.wtgPendingPlayerInputType || actionType || 'do')
     : 'continue';
-  const continueGeneration = !pendingPlayerInput && !skipAutomaticTiming;
-  const shouldEstimateTime = !retryGeneration && (
-    (pendingPlayerInput && freshPendingPlayerInput) ||
-    continueGeneration
-  );
+  const shouldEstimateTime = !skipAutomaticTiming &&
+    (!pendingPlayerInput || freshPendingPlayerInput);
 
   if (shouldEstimateTime) {
     const playerText = pendingPlayerInput
       ? String(state.wtgPendingPlayerInputRaw || state.wtgPendingPlayerInputText || '')
       : '';
-    const timingText = pendingPlayerInput
+    const timingText = playerText
       ? `${playerText}\n${narrative}`.trim()
       : narrative;
     const turnData = getTurnData();
@@ -2396,23 +2305,6 @@ function onOutput_WTG(text) {
       state.changed = true;
     }
     updateWTGDebugCard();
-  } else if (retryGeneration) {
-    const remainder = getDynamicMinuteRemainder();
-    state.wtgLastDynamicEstimate = {
-      mode: 'retry',
-      category: 'skipped',
-      minutes: 0,
-      rawMinutes: 0,
-      textLength: 0,
-      sceneFactor: 0,
-      similarityFactor: 0,
-      timeMultiplier: getTimeMultiplier(),
-      explicitMinutes: 0,
-      similarity: state.wtgSimilarity,
-      previousRemainder: remainder,
-      remainder
-    };
-    updateWTGDebugCard();
   }
   delete state.wtgSkipNextAutomaticTiming;
 
@@ -2433,12 +2325,18 @@ function onOutput_WTG(text) {
     }
   }
 
-  // Store turn data for subsequent reconstruction and erase cleanup.
-  if (lastAction && retryGeneration && !retryingContinue && actionType !== "continue") {
-    upsertLatestTurnData(actionType, lastAction.text, narrative, formatTurnTime(state.turnTime));
-  } else if (lastAction && pendingInputMatchesLastAction && actionType !== "continue") {
+  // Persist every visible AI output as a rewind anchor. Continue generations
+  // must be recorded because they can be erased without changing player actions.
+  const persistedResponse = sanitizeSystemLeakage(modifiedText);
+  const persistedActionType = pendingPlayerInput
+    ? (state.wtgPendingPlayerInputType || actionType || 'do')
+    : 'continue';
+  const persistedActionText = pendingPlayerInput
+    ? String(state.wtgPendingPlayerInputRaw || state.wtgPendingPlayerInputText || '')
+    : '';
+  if (normalizeActionText(persistedResponse)) {
     const timestamp = formatTurnTime(state.turnTime);
-    addTurnData(actionType, lastAction.text, narrative, timestamp);
+    addTurnData(persistedActionType, persistedActionText, persistedResponse, timestamp);
   }
 
   if (pendingPlayerInput) {
@@ -2452,16 +2350,10 @@ function onOutput_WTG(text) {
   }
 
   // Before final visible output, sanitize accidental system time and system command leakage.
-  modifiedText = sanitizeSystemLeakage(modifiedText);
+  modifiedText = persistedResponse;
 
   // Ensure modified text starts with leading space
   modifiedText = ensureLeadingSpace(modifiedText);
-
-  const currentGenerationWasContinue = retryGeneration
-    ? retryingContinue
-    : continueGeneration;
-  rememberGeneratedOutput(modifiedText, currentGenerationWasContinue);
-  delete state.wtgRetryGeneration;
 
   return modifiedText;
 }

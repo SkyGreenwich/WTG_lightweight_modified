@@ -292,7 +292,21 @@ function getSleepDuration(currentTime) {
   let config = null;
 
   if (isPreciseTime(currentTime)) {
-    config = getDescriptiveTimeConfig(getDescriptiveBucketFromPreciseTime(currentTime));
+    const bucket = getDescriptiveBucketFromPreciseTime(currentTime);
+    config = getDescriptiveTimeConfig(bucket);
+
+    // After midnight, choose an early-morning wake time instead of adding
+    // a full night's sleep from an already-late starting point.
+    if (bucket === 'midnight') {
+      const {hour, min} = parseTime(currentTime);
+      const currentMinute = hour * 60 + min;
+      const wakeMinute = randomIntInclusive(6 * 60, 8 * 60);
+      const durationMinutes = wakeMinute - currentMinute;
+      return {
+        hours: Math.floor(durationMinutes / 60),
+        minutes: durationMinutes % 60,
+      };
+    }
   } else {
     config = getDescriptiveTimeConfig(currentTime);
   }

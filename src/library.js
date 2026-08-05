@@ -13,6 +13,7 @@ const WTG_TURN_DATA_JSON_END = '[/Turn Data JSON]';
 const WTG_DYNAMIC_CHARS_PER_MINUTE = 700;
 const WTG_DYNAMIC_MAX_AUTO_MINUTES = 5;
 const WTG_DYNAMIC_MAX_EXPLICIT_MINUTES = 10;
+const WTG_MAX_OPENING_ACTIONS = 2;
 const WTG_TURN_TIME_MARKER_REGEX = /\[\[-?\d+y\d+m\d+d\d+h\d+n\d+s\]\]/g;
 const WTG_STORYCARD_TIMESTAMP_REGEX = /(?:^|\n+)(Discovered on|Met on|Visited) (\d{1,2}\/\d{1,2}\/\d{4})\s+([^\n]+)/;
 const WTG_STORYCARD_TIMESTAMP_REMOVE_REGEX = /\n*(?:Discovered on|Met on|Visited) \d{1,2}\/\d{1,2}\/\d{4}\s+[^\n]+/;
@@ -838,6 +839,68 @@ function getHostActionType(fallback = 'continue') {
     }
   }
   return fallback;
+}
+
+function getActionCount() {
+  const value = typeof info !== 'undefined' && info && Number(info.actionCount);
+  return Number.isFinite(value) ? value : (Array.isArray(history) ? history.length : 0);
+}
+
+function hasExplicitClockInitializationMarker() {
+  const dataCard = storyCards.find(card => card.title === "WTG Data");
+  return Boolean(dataCard && dataCard.entry && dataCard.entry.includes('[SETTIME_INITIALIZED]'));
+}
+
+function hasSavedOutputAnchors(turnData) {
+  return Array.isArray(turnData) && turnData.some(record =>
+    record.version >= 4 && normalizeActionText(record.responseText)
+  );
+}
+
+function hasGeneratedOutputInHistory(turnData, historyItems) {
+  const actions = Array.isArray(historyItems) ? historyItems : [];
+  if (actions.some(action => String(action && action.type || '').toLowerCase() === 'continue')) {
+    return true;
+  }
+  return Boolean(findLatestTurnDataEntryInHistory(turnData, actions));
+}
+
+function isOpeningGeneration(turnData = getTurnData()) {
+  const actions = Array.isArray(history) ? history : [];
+  const typedActions = actions.filter(action => (
+    action && typeof action.type === 'string' && action.type.trim()
+  ));
+
+  if (hasGeneratedOutputInHistory(turnData, actions)) {
+    return false;
+  }
+
+  if (typedActions.length > 0) {
+    return true;
+  }
+
+  if (hasSavedOutputAnchors(turnData)) {
+    return false;
+  }
+
+  return getActionCount() <= WTG_MAX_OPENING_ACTIONS;
+}
+
+function refreshOpeningClockForRetry(turnData = getTurnData()) {
+  if (WTG_SCENE_START_TIME_MODE !== 'random') return false;
+  if (hasExplicitClockInitializationMarker()) return false;
+  if (!isOpeningGeneration(turnData)) return false;
+
+  state.startingDate = WTG_SCENE_START_DATE;
+  state.startingTime = getSceneDefaultStartTime();
+  state.turnTime = {years:0, months:0, days:0, hours:0, minutes:0, seconds:0};
+  const current = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
+  state.currentDate = current.currentDate;
+  state.currentTime = current.currentTime;
+  state.settimeInitialized = true;
+  clearDynamicMinuteRemainder();
+  state.changed = true;
+  return true;
 }
 
 /**
@@ -2099,11 +2162,13 @@ function onContext_WTG(text) {
     clearDynamicMinuteRemainder();
   }
 
+  const openingClockRefreshed = refreshOpeningClockForRetry(turnData);
+
   // The host-managed state is the authoritative running clock.
   // Storycard data may still contain entries from the erased future.
   const {lastTT, found: markerFound} = getLastTurnTime(history);
   let baseTT = normalizeTurnTimeSign(state.turnTime);
-  if (historyRolledBack) {
+  if (historyRolledBack || openingClockRefreshed) {
     baseTT = rollbackTurnTime || (markerFound
       ? lastTT
       : {years:0, months:0, days:0, hours:0, minutes:0, seconds:0});
@@ -2131,7 +2196,7 @@ function onContext_WTG(text) {
   } else {
     state.turnTime = baseTT;
   }
-  if (historyRolledBack) {
+  if (historyRolledBack || openingClockRefreshed) {
     state.changed = true;
   }
 

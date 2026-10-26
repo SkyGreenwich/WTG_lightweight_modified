@@ -12,13 +12,22 @@ const WTG_SCENE_START_DATE = '04/04/2026'; // Or change it as needed
 // constants are only the factory defaults / card-less fallback (= 300 cpm).
 const WTG_DEFAULT_TEXT_CHARS_PER_TURN = 600;
 const WTG_DEFAULT_TURNS_PER_HOUR = 30;
-const WTG_DYNAMIC_MAX_EXPLICIT_MINUTES = 720;
 const WTG_MAX_OPENING_ACTIONS = 2;
-// AI-issued time commands are gated by in-game-time cooldowns so the AI can
-// participate in time management without being able to spam the clock.
+// AI-issued time commands are gated so the AI can participate in time
+// management without spamming the clock. Sleep is gated by in-game time (you
+// cannot sleep again eight hours after waking); advance is gated per response
+// instead - a game-time spacing rule cannot restrain a game-time jump, because
+// the jump itself satisfies the spacing.
 const WTG_AI_SLEEP_COOLDOWN = {hours: 8};
-const WTG_AI_ADVANCE_COOLDOWN = {minutes: 5};
 const WTG_AI_COMMAND_REGEX = /\((sleep|advance)\b([^)]*)\)/gi;
+// Target-form arguments: "(advance until evening)", "(advance to 6:00 AM)",
+// "(sleep until morning)". A target names an arrival point instead of a
+// duration, so the clock lands on a boundary the model can reason about
+// directly - no minute arithmetic on the model's side.
+const WTG_AI_TARGET_PREFIX_REGEX = /^(?:to|until|till)\s+/i;
+const WTG_AI_TARGET_PHASE_REGEX = /^(?:the\s+)?(?:(tomorrow|next|following)\s+)?(morning|noon|midday|afternoon|evening|dusk|sunset|night|nightfall|dawn|sunrise|midnight)$/i;
+const WTG_AI_TARGET_CLOCK_REGEX = /^(?:the\s+)?(?:(tomorrow|next|following)\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})$/i;
+const WTG_AI_TARGET_PHASE_ALIASES = {nightfall: 'evening'};
 const WTG_MAX_TURN_DATA_RECORDS = 150; // Turn log cap: covers AID's ~100-entry history window with margin
 const WTG_MAX_STORED_TEXT_LENGTH = 400; // Per-record text cap that bounds WTG Data card growth
 const WTG_TURN_TIME_MARKER_REGEX = /\[\[-?\d+y\d+m\d+d\d+h\d+n\d+s\]\]/g;
@@ -29,8 +38,11 @@ const WTG_MAX_STORYCARDS_TO_PROCESS = 200;
 // ("Met on 4/4/2026") must never swallow the NEXT line as its "time" — such a
 // line is simply not a stamp. System-written stamps always carry date and
 // time inline on one line.
-const WTG_STORYCARD_TIMESTAMP_REGEX = /(?:^|\n+)(Discovered on|Met on|Visited) (\d{1,2}\/\d{1,2}\/\d{4})[ \t]+([^\n]+)/;
-const WTG_STORYCARD_TIMESTAMP_REMOVE_REGEX = /\n*(?:Discovered on|Met on|Visited) \d{1,2}\/\d{1,2}\/\d{4}[ \t]+[^\n]+/;
+// Year width is 1-6 digits (WTG 3.0 parity): the clock legitimately produces
+// 5+ digit years (e.g. 12026), and a fixed \d{4} fails to recognize such
+// stamps — defeating the one-stamp-per-card guard and re-stamping every turn.
+const WTG_STORYCARD_TIMESTAMP_REGEX = /(?:^|\n+)(Discovered on|Met on|Visited) (\d{1,2}\/\d{1,2}\/\d{1,6})[ \t]+([^\n]+)/;
+const WTG_STORYCARD_TIMESTAMP_REMOVE_REGEX = /\n*(?:Discovered on|Met on|Visited) \d{1,2}\/\d{1,2}\/\d{1,6}[ \t]+[^\n]+/;
 
 // Mapping table for descriptive time expressions
 const descriptiveMap = new Map([
@@ -75,6 +87,11 @@ const DAYS_OF_WEEK = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'F
  * @param {string} name - Weekday name
  * @returns {number} 0-6 (Sunday=0), or -1
  */
+// ============================================================================
+// SCENE START CONFIGURATION
+// ============================================================================
+// How the opening clock is chosen: config card, explicit settime, or a random roll.
+
 function resolveDayOfWeek(name) {
   const lower = String(name || '').toLowerCase().trim();
   if (!lower) return -1;
@@ -161,6 +178,63 @@ function randomTimeInWindows(spans) {
 }
 
 /**
+ * Parses one token of the Starting Daterange list into a (startDate, days)
+ * pair where days is the number of valid landing days (CLOSED interval:
+ * both endpoints included). Reverse order ("04/30/2026-04/01/2026") is
+ * accepted and treated as the same interval. Returns null for malformed or
+ * year-overflow tokens.
+ * @param {string} token - Single daterange token, trimmed
+ * @returns {{start: string, days: number}|null} start as mm/dd/yyyy, days>=1
+ */
+function parseStartDaterangeToken(token) {
+  const raw = String(token || '').trim();
+  if (!raw) return null;
+
+  const rangeMatch = raw.match(/^(.+?)\s*-\s*(.+)$/);
+  if (!rangeMatch) return null;
+  const startParsed = normalizeDateInput(rangeMatch[1].trim());
+  const endParsed = normalizeDateInput(rangeMatch[2].trim());
+  if (startParsed.error || endParsed.error) return null;
+
+  const startDT = buildDateFromParts({year: startParsed.year, month: startParsed.month, day: startParsed.day});
+  const endDT = buildDateFromParts({year: endParsed.year, month: endParsed.month, day: endParsed.day});
+  // Difference in whole days (both point at midnight → floor is exact).
+  const diffDays = Math.round((endDT.getTime() - startDT.getTime()) / 86400000);
+  const days = Math.abs(diffDays) + 1; // closed interval, reverse tolerated
+  if (days < 1) return null;
+
+  // Keep the earlier date as the canonical start so the offset math is simple.
+  const startISO = diffDays >= 0 ? startParsed.date : endParsed.date;
+  return {start: startISO, days};
+}
+
+/**
+ * Rolls one date uniformly across the UNION of multiple daterange spans,
+ * weighting each span by its day count (so every day in every span has equal
+ * probability). Mirrors randomTimeInWindows for the Starting Daterange list.
+ * Deterministic given `random`, so tests can pin exact outcomes.
+ * @param {Array<{start: string, days: number}>} spans - Parsed spans
+ * @param {Function} random - PRNG in [0,1), defaults to Math.random
+ * @returns {string} Rolled mm/dd/yyyy date
+ */
+function randomDateInSpans(spans, random) {
+  const rnd = typeof random === 'function' ? random : Math.random;
+  const list = Array.isArray(spans) ? spans.filter(s => s && s.start && s.days > 0) : [];
+  if (list.length === 0) return '';
+  const totalDays = list.reduce((sum, s) => sum + s.days, 0);
+  let point = Math.floor(rnd() * totalDays);
+  for (const s of list) {
+    if (point < s.days) {
+      // `point` is already the offset within this span's day list.
+      return advanceDate(s.start, point);
+    }
+    point -= s.days;
+  }
+  // Fallback: last span's last day (unreachable with non-empty valid spans).
+  return advanceDate(list[list.length - 1].start, list[list.length - 1].days - 1);
+}
+
+/**
  * Returns the default start time for the current scene. An explicit config
  * card Starting Time is used as-is (deterministic opening); without one the
  * clock rolls randomly, constrained to the card's Starting Timerange when
@@ -198,14 +272,23 @@ function getSceneDefaultStartTime() {
 //   Starting Time: h:mm AM/PM
 //   Starting Weekday: Friday
 //   Starting Timerange: 6:00 AM-12:00 PM, 5:00 PM-10:00 PM
+//   Starting Daterange: 04/01/2026-04/10/2026, 05/01/2026-05/10/2026   (comma-separated spans; reverse order allowed per span)
 // The opening clock is fixed when Starting Time is given and random when it
-// is not (random rolls honor Starting Timerange). Missing lines fall back to
-// the top-of-file constants. The card is left in place after reading so it
-// keeps documenting the scenario. When a weekday is
-// given, it anchors all weekday display: the starting date IS that weekday and
-// later days derive from it (fictional calendars stay consistent). Starting Timerange restricts the random-mode roll to the listed time ranges
-// (comma-separated "H:MM AM/PM-H:MM AM/PM"; a start later than the end wraps
-// past midnight).
+// is not (random rolls honor Starting Timerange). The opening DATE is fixed
+// when Starting Date is given; only when a Starting Daterange is configured
+// (instead of Starting Date) does the date roll randomly — and then it re-rolls
+// on each opening retry, mirroring the random time within the same pre-commit
+// opening window. Starting Daterange accepts a comma-separated list of closed
+// "A-B" spans; the roll is uniform across their UNION, each span weighted by
+// its day count (reverse order per span is treated as the same span). With no
+// Starting Date and no Daterange, or no config card at all, the date falls
+// back to the top-of-file constant and stays fixed.
+// The card is left in place after reading so it keeps documenting the
+// scenario. When a weekday is given, it anchors all weekday display: the
+// starting date IS that weekday and later days derive from it (fictional
+// calendars stay consistent). Starting Timerange restricts the random-mode
+// roll to the listed time ranges (comma-separated "H:MM AM/PM-H:MM AM/PM"; a
+// start later than the end wraps past midnight).
 
 const WTG_SCENE_CONFIG_CARD_TITLE = 'WTG Scene Config';
 
@@ -242,8 +325,17 @@ function readSceneConfigCard() {
     const valid = tokens.filter(t => parseStartWindowToken(t) !== null);
     if (valid.length > 0) config.timerange = valid;
   }
+  const daterangeMatch = card.entry.match(/^\s*Starting Daterange:\s*(.+)\s*$/im);
+  if (daterangeMatch) {
+    const tokens = daterangeMatch[1].split(',').map(t => t.trim()).filter(Boolean);
+    // Keep only tokens that parse into real spans so an all-invalid line
+    // degrades to the default constant rather than blocking the roll with a
+    // single broken interval. Each span is a closed {start, days} union member.
+    const valid = tokens.map(t => parseStartDaterangeToken(t)).filter(Boolean);
+    if (valid.length > 0) config.daterange = valid;
+  }
 
-  return (config.date || config.time || config.weekday || config.timerange) ? config : null;
+  return (config.date || config.time || config.weekday || config.timerange || config.daterange) ? config : null;
 }
 
 /**
@@ -262,6 +354,16 @@ function applySceneConfigCard() {
     // consumer: getSceneDefaultStartTime reads WTG_SCENE_* constants, so the
     // override lives on state and consumers check it first.
     state.wtgSceneStartDate = config.date;
+  } else if (config.daterange) {
+    // Random opening date. Unlike TIME (which re-rolls per call whenever no
+    // explicit Starting Time exists), the DATE is only randomized when a
+    // Starting Daterange is configured. The rolled value is NOT pinned here:
+    // the opening-clock assignment paths (refreshOpeningClockForRetry /
+    // ensureClockStateInitialized) roll it fresh each opening retry and pin
+    // it to both state.startingDate and wtgSceneStartDate together, mirroring
+    // how the random time re-rolls within the same pre-commit opening window.
+    // We only stash the span list so those paths can roll on demand.
+    state.wtgSceneStartDaterange = config.daterange;
   }
   if (config.time) {
     state.wtgSceneStartTime = config.time;
@@ -284,12 +386,35 @@ function getSceneStartDate() {
 }
 
 /**
+ * Fresh start date for the opening clock. Re-rolls when a Starting Daterange
+ * is configured (mirroring the random-time re-roll on opening retries); for a
+ * fixed Starting Date or no config, returns the stable value identical to
+ * getSceneStartDate(). Callers that assign the opening clock (and that need
+ * the identity to track a real player action) must ALSO pin the result to
+ * state.wtgSceneStartDate so getSceneStartDate() stays consistent with the
+ * assigned startingDate.
+ * @returns {string} mm/dd/yyyy scene start date
+ */
+function rollSceneStartDate() {
+  const dr = state.wtgSceneStartDaterange;
+  if (Array.isArray(dr) && dr.length > 0) {
+    return randomDateInSpans(dr);
+  }
+  return getSceneStartDate();
+}
+
+/**
  * Formats validated 24-hour clock parts as WTG display time.
  * @param {number} hour - 24-hour clock hour
  * @param {number} min - Minute
  * @param {number} sec - Second
  * @returns {string} Time in h:mm AM/PM format
  */
+// ============================================================================
+// CLOCK MODEL
+// ============================================================================
+// Parsing, arithmetic and the turn-time vector that everything else measures against.
+
 function formatClockTime(hour, min, sec = 0) {
   let displayHour = hour;
   const period = displayHour < 12 ? 'AM' : 'PM';
@@ -420,7 +545,7 @@ function collectDateMentions(text) {
   if (!source) return [];
 
   const candidates = [];
-  const numericDateRegex = /\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}/g;
+  const numericDateRegex = /\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,6}/g;
   let match;
 
   while ((match = numericDateRegex.exec(source)) !== null) {
@@ -441,7 +566,7 @@ function collectDateMentions(text) {
     }
   }
 
-  const monthFirstRegex = new RegExp(`\\b(${WTG_MONTH_NAME_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,\\s*|\\s+)(\\d{4})\\b`, 'gi');
+  const monthFirstRegex = new RegExp(`\\b(${WTG_MONTH_NAME_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,\\s*|\\s+)(\\d{1,6})\\b`, 'gi');
   while ((match = monthFirstRegex.exec(source)) !== null) {
     const month = WTG_MONTH_NAME_TO_NUMBER.get(match[1].toLowerCase());
     const day = parseInt(match[2], 10);
@@ -456,7 +581,7 @@ function collectDateMentions(text) {
     }
   }
 
-  const dayFirstRegex = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${WTG_MONTH_NAME_PATTERN})(?:,\\s*|\\s+)(\\d{4})\\b`, 'gi');
+  const dayFirstRegex = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${WTG_MONTH_NAME_PATTERN})(?:,\\s*|\\s+)(\\d{1,6})\\b`, 'gi');
   while ((match = dayFirstRegex.exec(source)) !== null) {
     const day = parseInt(match[1], 10);
     const month = WTG_MONTH_NAME_TO_NUMBER.get(match[2].toLowerCase());
@@ -1037,6 +1162,56 @@ function getComparableTurnTimeValue(tt) {
   return parsed ? parsed.getTime() : NaN;
 }
 
+// Retry ledger bounds: a record keeps at most this many earlier attempts, each
+// with a capped text snapshot. Enough to cover the attempts a player actually
+// flips between, small enough that the turn-log card stays bounded.
+const WTG_MAX_RETRIES_PER_RECORD = 4;
+const WTG_RETRY_TEXT_CAP = 200;
+
+/**
+ * Normalizes a record's retry list to the bounded shape.
+ * @param {Array} list - Raw retry entries
+ * @returns {Array} Bounded, normalized entries (oldest first)
+ */
+// ============================================================================
+// TURN LOG
+// ============================================================================
+// One record per action: what was said, when, what the clock did, and what earlier attempts looked like.
+
+function normalizeRetryList(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(-WTG_MAX_RETRIES_PER_RECORD).map(entry => ({
+    timestamp: String(entry && entry.timestamp || ''),
+    pacing: String(entry && entry.pacing || ''),
+    estimate: Number.isInteger(entry && entry.estimate) ? entry.estimate : 0,
+    frame: String(entry && entry.frame || ''),
+    text: String(entry && entry.text || '').slice(0, WTG_RETRY_TEXT_CAP)
+  }));
+}
+
+/**
+ * Builds a turn-log record with every schema field present. Every writer goes
+ * through here so a newly added field cannot be forgotten at one call site -
+ * that is how `retries` and `frame` would otherwise drift apart.
+ * @param {Object} [partial] - Field overrides
+ * @returns {Object} Normalized record
+ */
+function makeRecord(partial) {
+  return normalizeTurnDataRecord(Object.assign({
+    version: 4,
+    actionCount: null,
+    actionType: '',
+    actionText: '',
+    responseText: '',
+    timestamp: '',
+    truncated: false,
+    pacing: '',
+    estimate: 0,
+    frame: '',
+    retries: []
+  }, partial || {}));
+}
+
 function normalizeTurnDataRecord(record) {
   const rawVersion = Number(record && record.version);
   const rawActionCount = record && record.actionCount;
@@ -1053,11 +1228,25 @@ function normalizeTurnDataRecord(record) {
     // True when responseText was head-truncated at the storage cap: matching
     // then uses prefix semantics (see storedResponseMatchesHistory).
     truncated: Boolean(record && record.truncated),
-    // Pacing audit trail (P19): the AI commands executed on this turn, as
-    // "command -> minutes" entries. Post-strip responses hide executed
-    // commands, so the log carries them explicitly for after-the-fact
-    // attribution of clock jumps.
-    pacing: String(record && record.pacing || '')
+    // Pacing audit trail (P19): every recognized AI command on this turn with
+    // its outcome - "command -> +N min" when applied, "(clamped to frame)" when
+    // the scene frame shortened it, "skipped (reason)" when suppressed.
+    // Post-strip responses hide executed commands, so the log carries them
+    // explicitly for after-the-fact attribution, and the next turn's context
+    // replays the latest line to the model as closed-loop feedback.
+    pacing: String(record && record.pacing || ''),
+    // Text-derived minutes for this turn, 0 when a command advanced instead.
+    // Lives on the record (not in state) so the clock line's contrast line is
+    // rewind-safe and needs no reset bookkeeping.
+    estimate: Number.isInteger(record && record.estimate) ? record.estimate : 0,
+    // Open scene frame at the end of this turn ('' when none). Kept on the
+    // entry so a rewind or redo carries the arc with the history instead of
+    // losing it in state.
+    frame: String(record && record.frame || ''),
+    // Earlier attempts of this same action, oldest first. A retry drops the
+    // record and the next attempt carries the list forward, so flipping back
+    // to an older attempt still has its timestamp. Bounded by design.
+    retries: normalizeRetryList(record && record.retries)
   };
 }
 
@@ -1198,6 +1387,15 @@ function renderTurnDataCard(records) {
     if (state.wtgOpenTimeFrame) {
       parts.push('open frame: ' + JSON.stringify(state.wtgOpenTimeFrame));
     }
+    if (state.wtgChangeType) parts.push('turn: ' + state.wtgChangeType);
+    if (Array.isArray(state.wtgAltBranches) && state.wtgAltBranches.length > 0) {
+      parts.push('branches: ' + state.wtgAltBranches.length + ' (' +
+        state.wtgAltBranches.map(b => b.records.length).join('/') + ')');
+    }
+    if (state.wtgRetryAmbiguous) parts.push('retry: ambiguous pick');
+    if (state.wtgClockUnverified) {
+      parts.push('clock unverified: ' + (state.wtgClockUnverifiedReason || 'unknown'));
+    }
     const budget = 20000;
     let used = 0;
     let omitted = 0;
@@ -1236,6 +1434,9 @@ function renderRecordDebugBlock(record) {
     '  response: ' + (record.responseText || '(none)') + (record.truncated ? ' [truncated]' : '')
   ];
   if (record.pacing) lines.push('  pacing: ' + record.pacing);
+  if (Array.isArray(record.retries) && record.retries.length > 0) {
+    lines.push('  retries: ' + record.retries.length);
+  }
   return lines.join('\n');
 }
 
@@ -1251,23 +1452,23 @@ function renderRecordDebugBlock(record) {
  * @param {string} actionText - Full action text
  * @param {string} responseText - AI response text
  * @param {string} timestamp - Turntime-formatted timestamp
- * @param {Object} [options] - { replaceSameCount?, pacing? }
+ * @param {Object} [options] - { replaceSameCount?, pacing?, estimate? }
  */
 function addTurnData(actionType, actionText, responseText, timestamp, options = {}) {
-  const actionCount = typeof info !== 'undefined' && info && Number.isInteger(info.actionCount)
-    ? info.actionCount
-    : null;
+  const actionCount = hostActionCount();
   const boundedAction = boundStoredText(actionText);
   const boundedResponse = boundStoredText(responseText);
-  const record = normalizeTurnDataRecord({
-    version: 4,
+  const record = makeRecord({
     actionCount,
     actionType,
     actionText: boundedAction.text,
     responseText: boundedResponse.text,
     timestamp,
     truncated: boundedResponse.truncated,
-    pacing: options.pacing || ''
+    pacing: options.pacing || '',
+    estimate: options.estimate || 0,
+    frame: options.frame || '',
+    retries: takePendingRetries(actionCount)
   });
 
   const records = getTurnData();
@@ -1284,7 +1485,7 @@ function addTurnData(actionType, actionText, responseText, timestamp, options = 
     // Its output is gone from history (the host removed it), so drop
     // same-count continue records whose text no longer exists there.
     const historyTexts = new Set(
-      (Array.isArray(history) ? history : [])
+      hostHistory()
         .map(item => normalizeActionText(item && item.text))
         .filter(Boolean)
     );
@@ -1305,22 +1506,6 @@ function addTurnData(actionType, actionText, responseText, timestamp, options = 
   }
 
   writeTurnData(keptRecords.concat([record]));
-}
-
-/**
- * Gets the most recent player action from history.
- * @param {Array} historyItems - History array
- * @returns {Object|null} Most recent do/say/story action; null if none exists
- */
-function getLatestPlayerAction(historyItems) {
-  if (!historyItems || historyItems.length === 0) return null;
-  for (let i = historyItems.length - 1; i >= 0; i--) {
-    const action = historyItems[i];
-    if (action.type === "do" || action.type === "say" || action.type === "story") {
-      return action;
-    }
-  }
-  return null;
 }
 
 /**
@@ -1347,8 +1532,8 @@ function getHostActionType(fallback = 'continue') {
 }
 
 function getActionCount() {
-  const value = typeof info !== 'undefined' && info && Number(info.actionCount);
-  return Number.isFinite(value) ? value : (Array.isArray(history) ? history.length : 0);
+  const value = hostActionCount();
+  return value === null ? hostHistory().length : value;
 }
 
 function hasExplicitClockInitializationMarker() {
@@ -1371,7 +1556,13 @@ function hasGeneratedOutputInHistory(turnData, historyItems) {
 }
 
 function isOpeningGeneration(turnData = getTurnData()) {
-  const actions = Array.isArray(history) ? history : [];
+  // A seeded log means the script joined a story already in progress, so the
+  // opening heuristics must stand down. Seeding itself is blocked inside the
+  // opening window (see backfillTurnLogFromHistory), so this cannot suppress a
+  // genuine opening.
+  if (state.wtgBackfilled) return false;
+
+  const actions = hostHistory();
   const typedActions = actions.filter(action => (
     action && typeof action.type === 'string' && action.type.trim()
   ));
@@ -1394,13 +1585,26 @@ function isOpeningGeneration(turnData = getTurnData()) {
 function refreshOpeningClockForRetry(turnData = getTurnData()) {
   // An explicit config-card time IS the start time: there is nothing random
   // left to re-roll, so the opening refresh has no purpose. Without one the
-  // opening is random by definition and each retry re-rolls.
+  // opening is random by definition and each retry re-rolls. A configured
+  // Starting Daterange re-rolls its date here too, alongside the time, and the
+  // result is pinned to wtgSceneStartDate so getSceneStartDate() and the
+  // assigned startingDate stay identical (the [settime] auto-scan gate and
+  // the weekday anchor both rely on that stable identity).
   applySceneConfigCard();
   if (state.wtgSceneStartTime) return false;
   if (hasExplicitClockInitializationMarker()) return false;
-  if (!isOpeningGeneration(turnData)) return false;
 
-  state.startingDate = getSceneStartDate();
+  // The opening window is "nothing has happened yet": the host count is still
+  // within the opening range and the log holds at most the opening response.
+  // In that window every generation is a fresh roll - first attempt, retry, or
+  // a Continue after erasing the opening - so the saved-anchor veto that
+  // isOpeningGeneration applies to committed output must not block it. Past
+  // the window the normal check decides, exactly as before.
+  const openingWindow = getActionCount() <= WTG_MAX_OPENING_ACTIONS && turnData.length <= 1;
+  if (!openingWindow && !isOpeningGeneration(turnData)) return false;
+
+  state.startingDate = rollSceneStartDate();
+  state.wtgSceneStartDate = state.startingDate;
   state.startingTime = getSceneDefaultStartTime();
   state.turnTime = {years:0, months:0, days:0, hours:0, minutes:0, seconds:0};
   const current = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
@@ -1526,50 +1730,341 @@ function trackSleepArcDeclaration(text) {
 }
 
 /**
+ * The host's action count, or null when the host does not provide one. The
+ * only place that reaches into the host's `info` global for a position.
+ * @returns {number|null} Host action count
+ */
+function hostActionCount() {
+  return (typeof info !== 'undefined' && info && Number.isInteger(info.actionCount))
+    ? info.actionCount
+    : null;
+}
+
+/**
+ * The host's history array, always an array.
+ * @returns {Array} Host history
+ */
+function hostHistory() {
+  return Array.isArray(history) ? history : [];
+}
+
+/**
+ * Actions the host has committed. The host pre-increments its action count for
+ * the pending action, so the committed count is one less.
+ * @param {Object} [hostInfo] - Host info; defaults to the live global
+ * @returns {number|null} Committed action count, or null when unknown
+ */
+function committedCountOf(hostInfo) {
+  const count = hostInfo && Number.isInteger(hostInfo.actionCount)
+    ? hostInfo.actionCount
+    : hostActionCount();
+  return count === null ? null : count - 1;
+}
+
+/**
+ * Refreshes record texts from the host's history. The host is the source of
+ * truth for what was actually said: after the player edits an entry, the
+ * record at that position still holds the old text, which would break branch
+ * matching later. Only AI entries at a cleanly mapped position are touched.
+ * @param {Array} turnData - Turn-log records
+ * @param {Array} historyItems - Host history
+ * @returns {Array} The records (re-read when anything was written)
+ */
+function freshenTurnLog(turnData, historyItems) {
+  const committed = committedCountOf(info);
+  const items = Array.isArray(historyItems) ? historyItems : [];
+  if (committed === null || items.length === 0 || turnData.length === 0) return turnData;
+
+  let changed = false;
+  for (const record of turnData) {
+    if (record.actionCount === null) continue;
+    const item = items[items.length - (committed - record.actionCount) - 1];
+    if (!item) continue;
+    const type = String(item.type || '').toLowerCase();
+    if (type === 'do' || type === 'say' || type === 'story') continue;
+    const hostText = normalizeActionText(item.text);
+    if (!hostText) continue;
+    if (storedResponseMatchesHistory(
+      normalizeActionText(record.responseText), Boolean(record.truncated), hostText
+    )) continue;
+    const bounded = boundStoredText(hostText);
+    record.responseText = bounded.text;
+    record.truncated = bounded.truncated;
+    changed = true;
+  }
+  if (!changed) return turnData;
+  writeTurnData(turnData);
+  return turnData;
+}
+
+// ============================================================================
+// BRANCH AND RETRY LEDGER
+// ============================================================================
+// A rewind drops every record after the rewind point. Without a ledger those
+// records are gone for good: a later redo lands on a clock with no anchor, the
+// pacing trail of the restored branch is lost, and an open scene frame cannot
+// come back. The ledger keeps the last few discarded tails - and the retried
+// responses - bounded in state, so a redo restores its own history instead of
+// guessing from card stamps.
+
+const WTG_MAX_ALT_BRANCHES = 3;
+const WTG_MAX_BRANCH_RECORDS = 12;
+const WTG_MAX_BACKFILL_RECORDS = 8;
+const WTG_BRANCH_TEXT_CAP = 200;
+
+/**
+ * Bounded copy of a record for ledger storage. Response text is capped so a
+ * branch cannot bloat state; everything the clock needs (count, timestamp,
+ * pacing, estimate, frame) survives intact.
+ * @param {Object} record - Turn-log record
+ * @returns {Object} Trimmed copy
+ */
+function toLedgerRecord(record) {
+  const text = String(record.responseText || '');
+  return {
+    actionCount: record.actionCount,
+    actionType: record.actionType,
+    timestamp: record.timestamp,
+    pacing: record.pacing,
+    estimate: record.estimate,
+    frame: record.frame,
+    retries: normalizeRetryList(record.retries),
+    responseText: text.slice(0, WTG_BRANCH_TEXT_CAP),
+    truncated: Boolean(record.truncated) || text.length > WTG_BRANCH_TEXT_CAP
+  };
+}
+
+/**
+ * Saves a discarded tail so a later redo can restore it. Newest branch first,
+ * oldest evicted past the cap.
+ * @param {number} cutoff - Last action count kept before the rewind
+ * @param {Array} dropped - Records removed from the log
+ */
+function saveAltBranch(cutoff, dropped) {
+  const records = dropped.slice(-WTG_MAX_BRANCH_RECORDS).map(toLedgerRecord);
+  if (records.length === 0) return;
+  const branches = (Array.isArray(state.wtgAltBranches) ? state.wtgAltBranches : []).filter(
+    b => !(b.cutoff === cutoff && b.records[0] && b.records[0].actionCount === records[0].actionCount)
+  );
+  state.wtgAltBranches = [{cutoff, records}].concat(branches).slice(0, WTG_MAX_ALT_BRANCHES);
+}
+
+/**
+ * True when every record's stored response still sits at the history position
+ * its action count implies: index = length - (committedCount - count) - 1.
+ * @param {Array} records - Candidate records, oldest first
+ * @param {number} committedCount - Actions the host has committed
+ * @param {Array} historyItems - Host history
+ * @returns {boolean} True when the whole run matches
+ */
+function branchMatchesHistory(records, committedCount, historyItems) {
+  const items = Array.isArray(historyItems) ? historyItems : [];
+  return records.every(record => {
+    const item = items[items.length - (committedCount - record.actionCount) - 1];
+    if (!item) return false;
+    return storedResponseMatchesHistory(
+      normalizeActionText(record.responseText),
+      Boolean(record.truncated),
+      normalizeActionText(item.text)
+    );
+  });
+}
+
+/**
+ * Finds a saved branch that continues exactly where the log stops and still
+ * matches the host's retained history. Text matching is what keeps a branch
+ * the player did not redo onto from being restored.
+ * @param {number} committedCount - Actions the host has committed
+ * @param {number} maxLoggedCount - Highest action count already in the log
+ * @returns {Array|null} Records to restore, or null
+ */
+function findRestorableBranch(committedCount, maxLoggedCount) {
+  const branches = Array.isArray(state.wtgAltBranches) ? state.wtgAltBranches : [];
+  for (const branch of branches) {
+    const candidates = branch.records.filter(r => (
+      r.actionCount > maxLoggedCount && r.actionCount <= committedCount
+    ));
+    if (candidates.length === 0) continue;
+    // Normally the branch must continue exactly where the log stops; with an
+    // empty log (a rewind past everything tracked) any start is allowed and the
+    // text match alone decides.
+    if (maxLoggedCount >= 0 && candidates[0].actionCount !== maxLoggedCount + 1) continue;
+    if (!branchMatchesHistory(candidates, committedCount, history)) continue;
+    return candidates;
+  }
+  return null;
+}
+
+/**
+ * Restores a matching branch into the log.
+ * @param {number} committedCount - Actions the host has committed
+ * @returns {number} Records restored (0 when nothing matched)
+ */
+function restoreAltBranch(turnData, committedCount) {
+  const maxLoggedCount = turnData.reduce((acc, r) => (
+    r.actionCount !== null && r.actionCount > acc ? r.actionCount : acc
+  ), -1);
+  const records = findRestorableBranch(committedCount, maxLoggedCount);
+  if (!records) return {records: turnData, restored: 0};
+
+  const kept = turnData.filter(r => r.actionCount === null || r.actionCount <= maxLoggedCount);
+  const merged = kept.concat(records.map(record => makeRecord(record)));
+  writeTurnData(merged);
+  state.wtgAltBranches = (state.wtgAltBranches || []).filter(
+    b => !(b.records[0] && records[0] && b.records[0].actionCount === records[0].actionCount)
+  );
+  return {records: merged, restored: records.length};
+}
+
+/**
+ * Seeds anchor records for actions this log never saw: a mid-adventure install,
+ * or a session long enough for the record cap to evict the front. Timestamps
+ * are interpolated backwards from the current clock at the estimator's own rate
+ * (text length / chars-per-minute), so a rewind into that range still finds an
+ * anchor instead of freezing. Runs only on an empty log with a verified clock,
+ * never rewrites existing records, and never runs on the turn that reset the
+ * clock (the old history belongs to a timeline that was just discarded).
+ * @param {Array} historyItems - Host history
+ * @returns {number} Records seeded
+ */
+function backfillTurnLogFromHistory(turnData, historyItems) {
+  if (state.wtgClockUnverified) return {records: turnData, seeded: 0};
+  if (turnData.length > 0) return {records: turnData, seeded: 0};
+  const items = Array.isArray(historyItems) ? historyItems : [];
+  const committedCount = committedCountOf(info);
+  if (committedCount === null || items.length === 0 || committedCount <= 0) {
+    return {records: turnData, seeded: 0};
+  }
+  // Seeding is for a story already in progress. During the opening window the
+  // empty log is the signal the opening clock re-rolls on, so it must stay
+  // empty until the story actually moves.
+  if (getActionCount() <= WTG_MAX_OPENING_ACTIONS) {
+    return {records: turnData, seeded: 0};
+  }
+
+  const cpm = getCharsPerMinute();
+  let seconds = turnTimeToApproxSeconds(normalizeTurnTimeSign(state.turnTime));
+  const seeded = [];
+  for (let offset = 0; offset < WTG_MAX_BACKFILL_RECORDS; offset++) {
+    const item = items[items.length - 1 - offset];
+    const count = committedCount - offset;
+    if (!item || count <= 0 || seconds <= 0) break;
+    seeded.unshift(makeRecord({
+      actionCount: count,
+      actionType: String(item.type || 'continue'),
+      timestamp: formatTurnTime(secondsToTurnTime(seconds))
+    }));
+    seconds -= Math.max(1, Math.round(String(item.text || '').length / cpm * 60));
+  }
+  if (seeded.length === 0) return {records: turnData, seeded: 0};
+  writeTurnData(seeded);
+  state.wtgBackfilled = true;
+  return {records: seeded, seeded: seeded.length};
+}
+
+/**
+ * Hands the record being regenerated to the next write. Its earlier attempts
+ * ride along, so the replacement record carries the whole chain and flipping
+ * back to an older attempt still has its timestamp.
+ * @param {Object} record - The record dropped by the retry
+ */
+function rememberPendingRetries(record) {
+  const prior = Array.isArray(record.retries) ? record.retries : [];
+  const snapshot = {
+    timestamp: record.timestamp,
+    pacing: record.pacing,
+    estimate: record.estimate,
+    frame: record.frame,
+    text: String(record.responseText || '').slice(0, WTG_RETRY_TEXT_CAP)
+  };
+  state.wtgPendingRetries = {
+    count: record.actionCount,
+    list: prior.concat([snapshot]).slice(-WTG_MAX_RETRIES_PER_RECORD)
+  };
+}
+
+/**
+ * Consumes the pending retry chain when this write belongs to the same action.
+ * @param {number|null} actionCount - Action count being written
+ * @returns {Array} Retry entries to store on the record
+ */
+function takePendingRetries(actionCount) {
+  const pending = state.wtgPendingRetries;
+  if (!pending || actionCount === null || pending.count !== actionCount) return [];
+  delete state.wtgPendingRetries;
+  return normalizeRetryList(pending.list);
+}
+
+/**
+ * Finds which attempt of the newest record's action the host actually kept.
+ * Flipping between retries runs no hook, so this is the only place the choice
+ * becomes visible - by text. Returns the kept attempt only when it is not the
+ * record's own response; a near-identical pair is flagged instead of guessed.
+ * @param {Object} record - Newest turn-log record
+ * @param {Array} historyItems - Host history
+ * @returns {Object|null} Kept earlier attempt, or null
+ */
+function resolveKeptRetry(record, historyItems) {
+  if (!record || !Array.isArray(record.retries) || record.retries.length === 0) return null;
+  const items = Array.isArray(historyItems) ? historyItems : [];
+  const lastText = normalizeActionText(items[items.length - 1] && items[items.length - 1].text);
+  if (!lastText) return null;
+  if (storedResponseMatchesHistory(
+    normalizeActionText(record.responseText), Boolean(record.truncated), lastText
+  )) return null;
+
+  const matches = record.retries.filter(entry => entry.text && lastText.startsWith(entry.text));
+  if (matches.length > 1) state.wtgRetryAmbiguous = true;
+  return matches.length > 0 ? matches[matches.length - 1] : null;
+}
+
+/**
  * Fast rewind/retry pruning driven by info.actionCount, the authoritative
  * position signal the host maintains. Record actionCount values are compared
  * against the current count:
  *   - records from a discarded future (count > current) are dropped;
  *   - the record with count === current is dropped on retry (the host reuses
  *     the same position for a new generation).
- * Retry is only recognized when the input hook ran this cycle: retry re-fires
- * input, but Continue generations do not — pruning on a bare count match would
- * discard the advance a same-turn command (e.g. [sleep]) had already applied.
+ * During a turn's hooks the host count is the index of the action being
+ * generated, so everything up to count-1 is committed and survives; anything
+ * above it belongs to a branch the player abandoned (a rewind) or is the
+ * response being regenerated (a retry). Neither case runs the input hook, so
+ * the count alone decides - the input-ran flag is not consulted.
  * Returns true when any record was removed, so callers know the turn log and
  * the clock need realignment. Records without an actionCount (legacy v3) are
  * left untouched here — text matching remains their fallback path.
  * @param {Array} turnData - Current turn data records
- * @param {boolean} inputRanThisCycle - True when the input hook fired this cycle
  * @returns {boolean} True if the turn log was pruned
  */
-function pruneTurnDataByActionCount(turnData, inputRanThisCycle) {
-  if (typeof info === 'undefined' || !info || !Number.isInteger(info.actionCount)) {
-    return false;
-  }
-  if (info.actionCount <= 0) return false;
+function pruneTurnDataByActionCount(turnData) {
+  const result = {records: turnData, changed: false, dropped: 0, retry: false};
+  const currentCount = hostActionCount();
+  if (currentCount === null || currentCount <= 0) return result;
 
-  const currentCount = info.actionCount;
-  const lastCountedIndex = turnData.reduce((acc, record, i) => (
-    record.actionCount !== null ? i : acc
-  ), -1);
-
-  // A surviving count === current record means the host position was already
-  // reflected in the log; treat it as retry evidence only when the input hook
-  // ran this cycle and the log ends exactly at the current position.
-  const retrySuspected = Boolean(inputRanThisCycle) &&
-    lastCountedIndex >= 0 &&
-    turnData[lastCountedIndex].actionCount === currentCount &&
-    lastCountedIndex === turnData.length - 1;
-
-  const cutoff = retrySuspected ? currentCount - 1 : currentCount;
+  const cutoff = currentCount - 1;
+  const droppedRecords = turnData.filter(record => (
+    record.actionCount !== null && record.actionCount > cutoff
+  ));
   const keptRecords = turnData.filter(record => (
     record.actionCount === null || record.actionCount <= cutoff
   ));
+  if (droppedRecords.length === 0) return result;
 
-  if (keptRecords.length === turnData.length) return false;
+  // The record for the action being regenerated is a retry, not a discarded
+  // branch: its chain rides forward into the replacement record. Everything
+  // above it belongs to a timeline the player left, so it is kept as a branch
+  // a redo can restore.
+  // Only a lone drop at the pending action is a retry: anything else is a
+  // rewind, and its whole tail belongs to a branch a redo can restore.
+  const isRetry = droppedRecords.length === 1 && droppedRecords[0].actionCount === currentCount;
+  if (isRetry) {
+    rememberPendingRetries(droppedRecords[0]);
+  } else {
+    saveAltBranch(cutoff, droppedRecords);
+  }
 
   writeTurnData(keptRecords);
-  return true;
+  return {records: keptRecords, changed: true, dropped: droppedRecords.length, retry: isRetry};
 }
 
 /**
@@ -1646,8 +2141,10 @@ function findLatestTurnDataEntryInHistory(turnData, historyItems = []) {
 }
 
 function trimTurnDataAfterIndex(turnData, index) {
-  if (!Array.isArray(turnData) || index < 0 || index >= turnData.length) return;
-  writeTurnData(turnData.slice(0, index + 1));
+  if (!Array.isArray(turnData) || index < 0 || index >= turnData.length) return turnData;
+  const trimmed = turnData.slice(0, index + 1);
+  writeTurnData(trimmed);
+  return trimmed;
 }
 
 /**
@@ -1940,6 +2437,11 @@ function parseDateTime(dateStr, timeStr) {
  * Gets or creates the WTG Data storycard
  * @returns {Object} WTG Data storycard object
  */
+// ============================================================================
+// STORY CARDS AND SETTINGS
+// ============================================================================
+// The system cards the script owns, and the settings card that configures it.
+
 function getWTGDataCard() {
   let dataCard = storyCards.find(card => card.title === "WTG Data");
   if (!dataCard) {
@@ -2022,7 +2524,8 @@ function ensureClockStateInitialized() {
   if (parsedStartDate.error || !validStartTime) {
     if (recoverClockStateFromDateTimeCard()) return;
 
-    state.startingDate = getSceneStartDate();
+    state.startingDate = rollSceneStartDate();
+    state.wtgSceneStartDate = state.startingDate;
     state.startingTime = getSceneDefaultStartTime();
     state.turnTime = {years:0, months:0, days:0, hours:0, minutes:0, seconds:0};
     state.settimeInitialized = true;
@@ -2142,6 +2645,31 @@ function addTimestampToCard(card, timestamp) {
 }
 
 /**
+ * Collapses duplicate discovery stamps on a storycard down to the newest one.
+ * Stamps are appended chronologically (addTimestampToCard appends at the end),
+ * so the LAST stamp line is the newest. Idempotent: a card with fewer than two
+ * stamp lines is left untouched. Heals the unbounded accumulation caused by
+ * the old 4-digit-year guard failing on 5+ digit years (e.g. 12026).
+ * @param {Object} card - Storycard to collapse
+ */
+function collapseDuplicateCardStamps(card) {
+  if (!card || !card.entry) return;
+
+  const stampRe = new RegExp(WTG_STORYCARD_TIMESTAMP_REGEX.source, 'g');
+  const stamps = [];
+  let m;
+  while ((m = stampRe.exec(card.entry)) !== null) {
+    stamps.push(`${m[1]} ${m[2]} ${m[3]}`);
+  }
+  if (stamps.length < 2) return;
+
+  const newestStamp = stamps[stamps.length - 1];
+  const removeRe = new RegExp(WTG_STORYCARD_TIMESTAMP_REMOVE_REGEX.source, 'g');
+  const cleaned = card.entry.replace(removeRe, '').trimEnd();
+  card.entry = cleaned ? `${cleaned}\n\n${newestStamp}` : newestStamp;
+}
+
+/**
  * Checks whether a storycard already has a timestamp
  * @param {Object} card - Storycard to check
  * @returns {boolean} True if already has timestamp
@@ -2209,7 +2737,7 @@ function updateAllStoryCardTimestamps(newDate, newTime) {
     if (card.entry && (card.entry.includes("Discovered on") || card.entry.includes("Met on") || card.entry.includes("Visited"))) {
       if (card.entry.includes("Unknown")) {
         // Replace placeholder timestamp with new timestamp
-        card.entry = card.entry.replace(/(Discovered on|Met on|Visited) \d{1,2}\/\d{1,2}\/\d{4}[ \t]+Unknown/, `$1 ${timestamp}`);
+        card.entry = card.entry.replace(/(Discovered on|Met on|Visited) \d{1,2}\/\d{1,2}\/\d{1,6}[ \t]+Unknown/, `$1 ${timestamp}`);
       }
     }
   }
@@ -2263,7 +2791,6 @@ function getWTGSettingsCard() {
     settingsCard.keys = ""; // No keys to avoid entering AI context
     settingsCard.description = "World Time Generator Settings - Edit the values below to configure the system.";
     settingsCard.entry = `Time Duration Multiplier: 1.0
-Explicit Duration Cap: ${WTG_DYNAMIC_MAX_EXPLICIT_MINUTES}
 Text Characters per Turn: ${WTG_DEFAULT_TEXT_CHARS_PER_TURN}
 Number of Turns per Hour: ${WTG_DEFAULT_TURNS_PER_HOUR}
 AI Time Commands: true
@@ -2288,11 +2815,6 @@ function migrateWTGSettings(settingsCard) {
     settingsCard.entry = settingsCard.entry.trim()
       ? `${settingsCard.entry.trim()}\nWTG Disabled: ${value}`
       : `WTG Disabled: ${value}`;
-  }
-  if (!/^\s*Explicit Duration Cap:\s*\d+(?:\.\d+)?\s*$/im.test(settingsCard.entry)) {
-    settingsCard.entry = settingsCard.entry.trim()
-      ? `${settingsCard.entry.trim()}\nExplicit Duration Cap: ${WTG_DYNAMIC_MAX_EXPLICIT_MINUTES}`
-      : `Explicit Duration Cap: ${WTG_DYNAMIC_MAX_EXPLICIT_MINUTES}`;
   }
   if (!/^\s*AI Time Commands:\s*(true|false)\s*$/im.test(settingsCard.entry)) {
     settingsCard.entry = settingsCard.entry.trim()
@@ -2358,10 +2880,8 @@ function areAITimeCommandsEnabled() {
  * @returns {boolean}
  */
 function isOpeningTimeGuardActive() {
-  if (typeof info === 'undefined' || !info || !Number.isInteger(info.actionCount)) {
-    return false;
-  }
-  if (info.actionCount > 1) return false;
+  const actionCount = hostActionCount();
+  if (actionCount === null || actionCount > 1) return false;
 
   const tt = normalizeTurnTimeSign(state.turnTime);
   return !hasTurnTimeMagnitude(tt);
@@ -2382,19 +2902,6 @@ function getTimeMultiplier() {
     return Number.isFinite(value) && value > 0 ? value : 1.0;
   }
   return 1.0;
-}
-
-function getExplicitDurationCapMinutes() {
-  const settingsCard = getWTGSettingsCard();
-  if (!settingsCard || !settingsCard.entry) return WTG_DYNAMIC_MAX_EXPLICIT_MINUTES;
-
-  const regex = /^\s*Explicit Duration Cap:\s*((?:\d+(?:\.\d*)?)|(?:\.\d+))\s*$/im;
-  const match = settingsCard.entry.match(regex);
-  if (match) {
-    const value = Math.floor(parseFloat(match[1]));
-    return Number.isFinite(value) && value > 0 ? value : WTG_DYNAMIC_MAX_EXPLICIT_MINUTES;
-  }
-  return WTG_DYNAMIC_MAX_EXPLICIT_MINUTES;
 }
 
 /**
@@ -2436,7 +2943,8 @@ function applyDynamicMinuteRemainder(estimate) {
   // Time-ledger semantics (WTG 3.0 flow model): the full raw estimate
   // accumulates across turns — no per-turn truncation, so long turns bank
   // their excess instead of discarding it. Category factors still scale the
-  // raw (a memory turn still sits at zero); only the discarding is gone.
+  // raw (a recollection turn runs at a tenth of the flow rate); only the
+  // discarding is gone.
   const totalMinutes = previousRemainder + rawMinutes;
   const minutes = Math.floor(totalMinutes + 1e-9);
   const remainder = totalMinutes - minutes;
@@ -2459,12 +2967,12 @@ function clampNumber(value, min, max) {
 }
 
 // ============================================================================
-// AI COMMAND COOLDOWNS
+// PACING GATES
 // ============================================================================
-// Sleep/advance commands issued by the AI (in parentheses) are allowed only
-// when the in-game clock has passed the cooldown threshold recorded at the
-// last AI command of that kind. Thresholds live in state as turn-time strings
-// so they rewind naturally with the clock.
+// What stops the AI from moving the clock: the sleep cooldown (in-game time,
+// because you cannot sleep again right after waking) lives here. Advance is
+// gated per response instead, in the executor below. Thresholds are turn-time
+// strings so they rewind naturally with the clock.
 
 /**
  * Returns true when the [sleep] command is still on cooldown, i.e. the
@@ -2479,30 +2987,11 @@ function isSleepCooldownActive() {
 }
 
 /**
- * Returns true when the advance command is still on cooldown.
- * @returns {boolean}
- */
-function isAdvanceCooldownActive() {
-  const threshold = state.wtgAdvanceCooldownUntil;
-  if (!threshold) return false;
-  const available = parseTurnTime(threshold);
-  return available ? compareTurnTime(state.turnTime, available) < 0 : false;
-}
-
-/**
  * Sets the sleep cooldown to expire after the given turn-time duration.
  * @param {Object} duration - {hours?, minutes?...} added to current turn time
  */
 function setSleepCooldown(duration) {
   state.wtgSleepCooldownUntil = formatTurnTime(addToTurnTime(state.turnTime, duration));
-}
-
-/**
- * Sets the advance cooldown to expire after the given turn-time duration.
- * @param {Object} duration - {hours?, minutes?...} added to current turn time
- */
-function setAdvanceCooldown(duration) {
-  state.wtgAdvanceCooldownUntil = formatTurnTime(addToTurnTime(state.turnTime, duration));
 }
 
 /**
@@ -2512,13 +3001,11 @@ function setAdvanceCooldown(duration) {
  * @param {Object} newTT - The rewound turn time object
  */
 function clearFutureCooldowns(newTT) {
-  for (const key of ['wtgSleepCooldownUntil', 'wtgAdvanceCooldownUntil']) {
-    const threshold = state[key];
-    if (!threshold) continue;
-    const thresholdTT = parseTurnTime(threshold);
-    if (thresholdTT && compareTurnTime(thresholdTT, newTT) > 0) {
-      delete state[key];
-    }
+  const threshold = state.wtgSleepCooldownUntil;
+  if (!threshold) return;
+  const thresholdTT = parseTurnTime(threshold);
+  if (thresholdTT && compareTurnTime(thresholdTT, newTT) > 0) {
+    delete state.wtgSleepCooldownUntil;
   }
 }
 
@@ -2570,6 +3057,11 @@ function hasConversationTimingContext(text, actionType = 'continue') {
     countSpeakerLines(rawText) > 0 ||
     hasCurrentSpeechReference(rawText);
 }
+
+// ============================================================================
+// DYNAMIC TIME ESTIMATION
+// ============================================================================
+// Turns narrative text into minutes: explicit durations first, then a text-length model.
 
 function parseDurationAmount(amountText) {
   const valueMap = {
@@ -2638,8 +3130,7 @@ const WTG_SAY_DO_EXCLUSION_REGEX = new RegExp('\\b(' + WTG_SAY_DO_EXCLUSION_SOUR
 // Transition-floor table (P2/P7 vocabulary, single home). Day-phase entries
 // ({target, fallback}) compute the gap from the current clock to the narrated
 // phase, falling back to the flat anchor; plain-number entries apply as flat
-// sleep-scale / next-day anchors. Targets bypass the Explicit Duration Cap
-// (self-limiting landing points); magnitude claims do not.
+// sleep-scale / next-day anchors.
 const WTG_TIME_FLOORS = {
   'until noon': { target: WTG_PHASE_CLOCK_ANCHORS.noon, fallback: 360 },
   'past noon': { target: WTG_PHASE_CLOCK_ANCHORS.noon, fallback: 360 },
@@ -2745,7 +3236,7 @@ function extractExplicitDurationMinutes(turnText) {
   // decision+passage ("He decided to wait, and twenty minutes went by")
   // is excluded with it.
   const pastOrHypotheticalRegex = WTG_SAY_DO_EXCLUSION_REGEX;
-  let statedMinutes = 0;     // duration matches, bounded by Explicit Duration Cap
+  let statedMinutes = 0;     // duration matches, summed as narrated
   let transitionMinutes = 0; // floor / wake-arrival targets (self-limiting)
   let match;
 
@@ -2764,11 +3255,10 @@ function extractExplicitDurationMinutes(turnText) {
     statedMinutes += amount * unitMinutes[unit];
   }
 
-  // The Explicit Duration Cap bounds magnitude claims ("three days") only.
-  // Transition targets (floors, wake-arrivals) form a closed, say/do-vetted
-  // phrase set whose landing point is self-limiting - they bypass the cap
-  // and compete by max() below.
-  statedMinutes = Math.round(clampNumber(statedMinutes, 0, getExplicitDurationCapMinutes()));
+  // Magnitude claims ("three days") are taken at face value. Nothing caps a
+  // single mention: a narration that says three days has passed three days,
+  // and the closing clamp below is only an outer sanity bound.
+  statedMinutes = Math.round(statedMinutes);
 
   // Scene-time transition floors: these phrases move the narration through a
   // phase of the day even without a stated duration. The vocabulary lives in
@@ -2777,8 +3267,7 @@ function extractExplicitDurationMinutes(turnText) {
   // duration match ("Let's sit here until noon." is a plan; "You sit there
   // until noon." is a fact). Day-phase entries compute the actual gap from
   // the current clock to the narrated phase; flat entries (sleep-scale /
-  // next-day) apply as-is. Transition targets bypass the Explicit Duration
-  // Cap (self-limiting landing points); magnitude claims do not.
+  // next-day) apply as-is.
   const floorRegex = new RegExp('\\b(' + WTG_TIME_FLOOR_SOURCE + ')\\b', 'gi');
   let floorMatch;
   while ((floorMatch = floorRegex.exec(lower)) !== null) {
@@ -2869,8 +3358,6 @@ function estimateDynamicTime(turnText, actionType = 'continue', similarity = 0, 
   const explicitMinutes = extractExplicitDurationMinutes(normalizedText);
 
   if (explicitMinutes > 0) {
-    // The Explicit Duration Cap is applied inside the extractor to magnitude
-    // claims only; transition targets arrive already resolved.
     const rawMinutes = explicitMinutes * multiplier;
     return {
       mode: 'explicit',
@@ -2891,8 +3378,11 @@ function estimateDynamicTime(turnText, actionType = 'continue', similarity = 0, 
   let minimumMinutes = 0;
 
   if (hasPastSpeechMemoryContext(memoryText, actionType)) {
+    // Recollection: the scene is looking back, not living forward. Time still
+    // passes — a memory is told over a few real minutes — but at a tenth of
+    // the flow rate, because nothing in it is happening now.
     category = 'memory';
-    sceneFactor = 0;
+    sceneFactor = 0.1;
   } else if (hasConversationTimingContext(normalizedText, actionType)) {
     category = 'dialogue';
     sceneFactor = 0.65;
@@ -2929,9 +3419,7 @@ function estimateDynamicTime(turnText, actionType = 'continue', similarity = 0, 
     * similarityFactor
     * multiplier;
   const rawMinutes = Math.max(minimumMinutes * multiplier, calculatedMinutes);
-  const minutes = sceneFactor === 0
-    ? 0
-    : Math.floor(rawMinutes);
+  const minutes = Math.floor(rawMinutes);
 
   return {
     mode: 'dynamic',
@@ -3021,18 +3509,85 @@ function ensureLeadingSpace(actionText) {
 // cooldowns, and always stripped from the visible narrative.
 
 /**
- * Parses the argument tail of an AI advance command, e.g. " 2 hours" or
- * "1 month 2 days". Reuses parseAdvanceSpec so AI and player share one
- * grammar. Returns the same {add, summary} or {error} shape.
+ * Resolves an arrival point to a forward-only delta from the current clock.
+ * A target equal to the current minute lands on the next occurrence, matching
+ * the phase semantics of the sleep-arc detector.
+ * @param {number} nowMinutes - Current clock in minutes past midnight
+ * @param {number} targetMinutes - Arrival point in minutes past midnight
+ * @param {boolean} dayQualified - True when the argument said tomorrow/next/following
+ * @returns {number} Positive minutes to add
+ */
+function resolveTargetDeltaMinutes(nowMinutes, targetMinutes, dayQualified) {
+  if (dayQualified) return 1440 - nowMinutes + targetMinutes;
+  const delta = targetMinutes - nowMinutes;
+  return delta > 0 ? delta : delta + 1440;
+}
+
+/**
+ * Parses a target-form argument tail: "until evening", "to 6:00 AM",
+ * "until tomorrow night". Returns null when the text is not target syntax
+ * (parenthesized prose such as "(advance to the next room)"), an error object
+ * flagged `unresolved` when it is target syntax but the clock cannot resolve
+ * it, and {add, summary} on success.
+ * @param {string} raw - Argument tail, already trimmed
+ * @returns {Object|null} Parse result, null for non-target text
+ */
+function parseAITargetSpec(raw) {
+  const prefix = raw.match(WTG_AI_TARGET_PREFIX_REGEX);
+  if (!prefix) return null;
+  const target = raw.slice(prefix[0].length).trim();
+
+  const phaseMatch = target.match(WTG_AI_TARGET_PHASE_REGEX);
+  const clockMatch = phaseMatch ? null : target.match(WTG_AI_TARGET_CLOCK_REGEX);
+  if (!phaseMatch && !clockMatch) return null;
+
+  const qualifier = (phaseMatch || clockMatch)[1] || '';
+  const dayQualified = /^(?:tomorrow|next|following)$/i.test(qualifier);
+
+  const now = state.currentTime && state.currentTime !== 'Unknown' ? parseClockTime(state.currentTime) : null;
+  if (!now) {
+    return {error: '[AI time target needs a known clock.]', unresolved: true};
+  }
+  const nowMinutes = now.hour * 60 + now.min;
+
+  if (phaseMatch) {
+    const phaseName = phaseMatch[2].toLowerCase();
+    const anchor = WTG_PHASE_CLOCK_ANCHORS[WTG_AI_TARGET_PHASE_ALIASES[phaseName] || phaseName];
+    if (anchor == null) return null;
+    return {
+      add: {minutes: resolveTargetDeltaMinutes(nowMinutes, anchor, dayQualified)},
+      summary: `to ${phaseName}`
+    };
+  }
+
+  const clockText = clockMatch[2];
+  const parsedClock = parseClockTime(clockText);
+  if (!parsedClock) return null;
+  // A bare "7:00" is ambiguous: take whichever reading arrives first.
+  const hours = [parsedClock.hour];
+  if (!/\b(?:am|pm)\b/i.test(clockText) && parsedClock.hour >= 1 && parsedClock.hour <= 12) {
+    hours.push(parsedClock.hour + 12);
+  }
+  let minutes = Infinity;
+  for (const hour of hours) {
+    minutes = Math.min(minutes, resolveTargetDeltaMinutes(nowMinutes, hour * 60 + parsedClock.min, dayQualified));
+  }
+  return {add: {minutes}, summary: `to ${parsedClock.display}`};
+}
+
+/**
+ * Parses the argument tail of an AI advance command. Accepts either a relative
+ * duration (" 2 hours", "1 month 2 days", reusing parseAdvanceSpec so AI and
+ * player share one grammar) or a target (" until evening", " to 6:00 AM").
  * @param {string} argText - Raw argument tail inside the parentheses
- * @returns {Object} Parsed result from parseAdvanceSpec
+ * @returns {Object} {add, summary} on success, {error} on failure
  */
 function parseAIAdvanceArgs(argText) {
   const raw = String(argText || '').trim();
   if (!raw) {
     return {error: '[AI advance requires an amount, e.g. (advance 30 minutes).]'};
   }
-  return parseAdvanceSpec(raw);
+  return parseAITargetSpec(raw) || parseAdvanceSpec(raw);
 }
 
 /**
@@ -3069,6 +3624,32 @@ function findAITimeCommands(text) {
 }
 
 /**
+ * Records a suppressed command: counted, stripped from the narrative, and
+ * reported in the outcome notes the next turn's context replays.
+ * @param {Object} result - Executor accumulator
+ * @param {Object} cmd - Command from findAITimeCommands
+ * @param {string} reason - Short reason, shown to the model verbatim
+ */
+function skipCommand(result, cmd, reason) {
+  result.skipped++;
+  result.removable.push(cmd.full);
+  result.notes.push(`${cmd.full} -> skipped (${reason})`);
+}
+
+/**
+ * Records an executed command with the minutes it actually moved the clock.
+ * @param {Object} result - Executor accumulator
+ * @param {Object} cmd - Command from findAITimeCommands
+ * @param {number} minutes - Minutes applied
+ * @param {boolean} clamped - True when the open scene frame shortened it
+ */
+function applyCommand(result, cmd, minutes, clamped) {
+  result.executed++;
+  result.removable.push(cmd.full);
+  result.notes.push(`${cmd.full} -> +${minutes} min${clamped ? ' (clamped to frame)' : ''}`);
+}
+
+/**
  * Executes AI-issued time commands found in the output, subject to cooldowns.
  * Executed commands advance the clock and set their cooldown; suppressed ones
  * are recorded as skipped. Commands that fail to parse are NOT executed and
@@ -3077,11 +3658,15 @@ function findAITimeCommands(text) {
  * When the AI Time Commands setting is off, nothing is executed and nothing
  * is stripped: parenthesized text is treated as pure narrative.
  * @param {string} text - Raw AI output
- * @returns {{executed: number, skipped: number, removable: string[]}} Counts
- *   plus the exact command texts to strip from the narrative
+ * @param {boolean} suppressForRecollection - True when this turn is a
+ *   recollection; commands are stripped and reported but never executed
+ * @returns {{executed: number, skipped: number, removable: string[], notes: string[]}}
+ *   Counts, the exact command texts to strip from the narrative, and one
+ *   outcome line per recognized command (applied, clamped, or skipped) used as
+ *   the next turn's closed-loop feedback.
  */
-function executeAITimeCommands(text) {
-  const result = {executed: 0, skipped: 0, removable: [], applied: []};
+function executeAITimeCommands(text, suppressForRecollection = false) {
+  const result = {executed: 0, skipped: 0, removable: [], notes: []};
   if (!areAITimeCommandsEnabled()) return result;
 
   const commands = findAITimeCommands(text);
@@ -3094,8 +3679,22 @@ function executeAITimeCommands(text) {
   if (openingGuard || state.wtgClockUnverified) {
     for (const cmd of commands) {
       if (isWellFormedAICommand(cmd)) {
-        result.removable.push(cmd.full);
-        result.skipped++;
+        skipCommand(result, cmd, 'clock not settled');
+      }
+    }
+    return result;
+  }
+
+  // Recollection turns: the narration is looking back, so a command that
+  // jumps the clock has no referent — there is nothing in a memory to skip
+  // forward through. Time still trickles (the estimator runs it at a tenth
+  // rate), but the model cannot spend in-game days inside a reminiscence.
+  // Same suppression shape as the opening guard: recognized commands are
+  // stripped and reported, not executed.
+  if (suppressForRecollection) {
+    for (const cmd of commands) {
+      if (isWellFormedAICommand(cmd)) {
+        skipCommand(result, cmd, 'recollection scene');
       }
     }
     return result;
@@ -3116,7 +3715,7 @@ function executeAITimeCommands(text) {
   if (frame) {
     frameRemaining = Math.max(0, frameDeclared - (turnTimeToApproxSeconds(state.turnTime) / 60 - frame.baseMinutes));
   }
-  let largeSkipUsed = false;
+  let advanceUsed = false;
   for (const cmd of commands) {
     if (cmd.command === 'sleep') {
       // Validate arguments BEFORE the cooldown gate: unparseable arguments
@@ -3125,34 +3724,41 @@ function executeAITimeCommands(text) {
       let explicitAdd = null;
       if (cmd.args) {
         const parsed = parseAIAdvanceArgs(cmd.args);
-        if (!isUsableAdvanceAdd(parsed)) continue;
+        if (!isUsableAdvanceAdd(parsed)) {
+          // Target-shaped but unresolvable: recognizable syntax, so strip it,
+          // but the clock cannot land on it - skip and report.
+          if (parsed && parsed.unresolved) {
+            skipCommand(result, cmd, 'clock not settled');
+          }
+          continue;
+        }
         explicitAdd = parsed.add;
       }
       if (isSleepCooldownActive()) {
-        result.skipped++;
-        result.removable.push(cmd.full);
+        skipCommand(result, cmd, 'cooldown');
         continue;
       }
       // Bare (sleep) shares the player's [sleep] time-of-day model; an
       // explicit (sleep 9 hours) applies the requested duration directly.
       let add = explicitAdd || getSleepDuration(state.currentTime);
+      let clamped = false;
       if (frameRemaining != null) {
         if (frameRemaining <= 0) {
-          result.skipped++;
-          result.removable.push(cmd.full);
+          skipCommand(result, cmd, 'open scene frame exhausted');
           continue;
         }
         const wanted = turnTimeToApproxSeconds(add) / 60;
-        if (wanted > frameRemaining) add = {minutes: Math.round(frameRemaining)};
+        if (wanted > frameRemaining) {
+          add = {minutes: Math.round(frameRemaining)};
+          clamped = true;
+        }
       }
       state.turnTime = addToTurnTime(state.turnTime, add);
       const {currentDate, currentTime} = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
       state.currentDate = currentDate;
       state.currentTime = currentTime;
       setSleepCooldown(WTG_AI_SLEEP_COOLDOWN);
-      result.executed++;
-      result.removable.push(cmd.full);
-      result.applied.push(cmd.full + ' -> ' + Math.round(turnTimeToApproxSeconds(add) / 60) + 'min');
+      applyCommand(result, cmd, Math.round(turnTimeToApproxSeconds(add) / 60), clamped);
       if (frameRemaining != null) {
         const applied = turnTimeToApproxSeconds(add) / 60;
         frame.appliedMinutes = (frame.appliedMinutes || 0) + applied;
@@ -3164,50 +3770,45 @@ function executeAITimeCommands(text) {
       // the cooldown happens to be active.
       const parsed = parseAIAdvanceArgs(cmd.args);
       if (!isUsableAdvanceAdd(parsed)) {
+        if (parsed && parsed.unresolved) {
+          skipCommand(result, cmd, 'clock not settled');
+        }
         // Unparseable argument: almost certainly narrative prose, not a
         // command. Leave the text alone.
         continue;
       }
       let add = parsed.add;
+      // One advance per response. A game-time cooldown cannot do this job: the
+      // jump itself satisfies any in-game spacing, so the only unit the command
+      // cannot outrun is the response it lives in. Multi-day jumps are covered
+      // by the same rule - one jump is one jump.
+      if (advanceUsed) {
+        skipCommand(result, cmd, 'one advance per turn');
+        continue;
+      }
+      let clamped = false;
       if (frameRemaining != null) {
         if (frameRemaining <= 0) {
-          result.skipped++;
-          result.removable.push(cmd.full);
+          skipCommand(result, cmd, 'open scene frame exhausted');
           continue;
         }
         const wanted = turnTimeToApproxSeconds(add) / 60;
-        if (wanted > frameRemaining) add = {minutes: Math.round(frameRemaining)};
-      }
-      // Large-skip guard: the 5-minute cooldown cannot chain-break multi-day
-      // jumps (each jump leaves the threshold far behind), so at most ONE
-      // multi-day advance is honored per output; further large advances are
-      // suppressed and stripped like cooldown-skipped ones.
-      const isLargeSkip = (add.days || 0) >= 1 || (add.months || 0) >= 1 || (add.years || 0) >= 1;
-      if (isLargeSkip && largeSkipUsed) {
-        result.skipped++;
-        result.removable.push(cmd.full);
-        continue;
-      }
-      if (isAdvanceCooldownActive()) {
-        result.skipped++;
-        result.removable.push(cmd.full);
-        continue;
+        if (wanted > frameRemaining) {
+          add = {minutes: Math.round(frameRemaining)};
+          clamped = true;
+        }
       }
       const current = computeCurrent(state.startingDate, state.startingTime, state.turnTime);
       const advanced = advanceDateTimeValue(current.currentDate, current.currentTime, add);
       if (!advanced) {
-        result.skipped++;
-        result.removable.push(cmd.full);
+        skipCommand(result, cmd, 'unresolvable date');
         continue;
       }
       state.currentDate = advanced.date;
       state.currentTime = advanced.time;
       state.turnTime = getDateDiff(state.startingDate, state.startingTime, state.currentDate, state.currentTime);
-      setAdvanceCooldown(WTG_AI_ADVANCE_COOLDOWN);
-      result.executed++;
-      result.removable.push(cmd.full);
-      result.applied.push(cmd.full + ' -> ' + Math.round(turnTimeToApproxSeconds(add) / 60) + 'min');
-      if (isLargeSkip) largeSkipUsed = true;
+      advanceUsed = true;
+      applyCommand(result, cmd, Math.round(turnTimeToApproxSeconds(add) / 60), clamped);
       if (frameRemaining != null) {
         const applied = turnTimeToApproxSeconds(add) / 60;
         frame.appliedMinutes = (frame.appliedMinutes || 0) + applied;
@@ -3219,6 +3820,9 @@ function executeAITimeCommands(text) {
   if (result.executed > 0) {
     clearDynamicMinuteRemainder();
     state.changed = true;
+    // Retires the cold-start syntax anchor: from here on the command syntax
+    // travels with the "Last pacing" line instead of a standing hint.
+    state.wtgPacingEverUsed = true;
   }
   return result;
 }
@@ -3232,16 +3836,72 @@ function executeAITimeCommands(text) {
  * @returns {boolean} True when the command syntax is valid
  */
 function isWellFormedAICommand(cmd) {
-  if (cmd.command === 'sleep') {
-    // Bare (sleep) is always well-formed; (sleep N unit) must parse to a
-    // usable duration, otherwise it is narrative prose.
-    if (!cmd.args) return true;
-    return isUsableAdvanceAdd(parseAIAdvanceArgs(cmd.args));
+  // Bare (sleep) is always well-formed.
+  if (cmd.command === 'sleep' && !cmd.args) return true;
+  if (cmd.command !== 'sleep' && cmd.command !== 'advance') return false;
+  // A resolvable duration or target is well-formed; so is a target whose
+  // anchor is missing (the syntax is right, only the clock cannot resolve it).
+  const parsed = parseAIAdvanceArgs(cmd.args);
+  return isUsableAdvanceAdd(parsed) || Boolean(parsed && parsed.unresolved);
+}
+
+// Pacing cue vocabulary, used only to decide whether this turn gets a hint.
+// Sleep keeps its own list without "rest": a short rest is a time-spending
+// beat, not a night's sleep (the shared sleep-arc verb list still matches
+// "rest" for frame detection, where a bare rest opens no enforced frame).
+// Transition outranks travel - "travelled for days" needs a multi-day form,
+// not a 20-minute one.
+const WTG_PACING_SLEEP_CUE_REGEX = /\b(?:sleep|sleeps|sleeping|naps?|napping|turn(?:s|ing)? in|go(?:es|ing)? to bed|bed down|hit the hay|hit the sack)\b/i;
+const WTG_PACING_TRANSITION_CUE_REGEX = /\b(?:later|afterward|afterwards|eventually|meanwhile|overnight|tomorrow|nightfall|daybreak|after that|before long|next (?:morning|day|week)|days? (?:pass|later)|weeks? later|for (?:a few |several |many )?(?:days|weeks|months|years))\b/i;
+const WTG_PACING_TRAVEL_CUE_REGEX = /\b(?:travel|journey|trek|hike|march|ride|sail|fly|drive|cross|return|leave|arrive|reach|head|proceed|walk|wait|rest|camp|search|explore|work|study|train)\b/i;
+
+/**
+ * Classifies what this turn's player action implies about time, so the pacing
+ * hint can be injected only when it is relevant. Judged from the player's
+ * action alone: the AI's narrative is written after this point, so a skip it
+ * invents cannot be predicted here - that case is covered after the fact by
+ * the clock line and the "Last pacing" feedback.
+ * @param {string} text - Player action text
+ * @returns {'sleep'|'transition'|'travel'|'none'} Cue kind
+ */
+function classifyPacingCue(text) {
+  const raw = String(text || '');
+  if (!raw) return 'none';
+  if (WTG_PACING_SLEEP_CUE_REGEX.test(raw)) return 'sleep';
+  if (WTG_PACING_TRANSITION_CUE_REGEX.test(raw)) return 'transition';
+  if (WTG_PACING_TRAVEL_CUE_REGEX.test(raw)) return 'travel';
+  return 'none';
+}
+
+/**
+ * Builds the on-demand pacing hint: at most one sentence chosen by the cue,
+ * and never naming a command that cannot run right now (an unavailable command
+ * name in the text invites a wasted attempt). An empty result means this turn
+ * says nothing about time, so the model is left alone.
+ * @param {'sleep'|'transition'|'travel'|'none'} cue - Cue from classifyPacingCue
+ * @param {boolean} sleepReady - False while the sleep cooldown is active
+ * @param {boolean} everUsed - False until the AI has executed its first command
+ * @returns {string} Hint text prefixed with a space, or ''
+ */
+function buildPacingHint(cue, sleepReady, everUsed) {
+  // No cue, no hint. A syntax reminder on an idle turn would be a standing
+  // menu again - the cold-start line rides along only when a beat actually
+  // involves time.
+  if (cue === 'none') return '';
+  const parts = [];
+  if (!everUsed) {
+    parts.push('Pacing commands: (sleep), (advance 30 minutes), (advance until evening) - start the action with one, on its own line.');
   }
-  if (cmd.command === 'advance') {
-    return isUsableAdvanceAdd(parseAIAdvanceArgs(cmd.args));
+  if (cue === 'sleep') {
+    parts.push(sleepReady
+      ? 'When the character sleeps, start the action with (sleep), or (sleep until morning) to land on a phase.'
+      : 'The character cannot sleep again yet - 8 in-game hours must pass. If the scene still moves, start the action with (advance 8 hours).');
+  } else if (cue === 'transition') {
+    parts.push('When the scene skips ahead, start the action with (advance until morning) or (advance 3 days).');
+  } else if (cue === 'travel') {
+    parts.push('When this beat spends time, start the action with (advance 20 minutes) for a short trip, (advance 2 hours) for a long one.');
   }
-  return false;
+  return ' ' + parts.join(' ');
 }
 
 /**
@@ -3279,10 +3939,14 @@ function sanitizeSystemLeakage(outputText) {
   cleaned = cleaned.replace(/^\s*Current date:\s*.*(?:\n|$)/gim, '');
   cleaned = cleaned.replace(/^\s*Current time:\s*.*(?:\n|$)/gim, '');
   cleaned = cleaned.replace(/^\s*Do not (?:recreate or reference any system commands|write player commands in \[square brackets\]).*(?:\n|$)/gim, '');
-  cleaned = cleaned.replace(/^\s*(?:You may (?:pace the scene with|control pacing by writing)|Scene pacing is resting for now).*(?:\n|$)/gim, '');
+  // Pacing hint echoes (see buildPacingHint). Each hint opens with a fixed
+  // phrase, so the whole line is removable without touching narrative prose.
+  cleaned = cleaned.replace(/^\s*(?:Pacing commands:|When the character sleeps|When the scene skips ahead|When this beat spends time|The character cannot sleep again yet).*(?:\n|$)/gim, '');
   cleaned = cleaned.replace(/^\s*Keep scene chronology consistent with the hidden current date\/time below\..*(?:\n|$)/gim, '');
   cleaned = cleaned.replace(/^\s*Do not expose system metadata.*(?:\n|$)/gim, '');
   cleaned = cleaned.replace(/^\s*Only mention exact time when the narrative naturally requires it\..*(?:\n|$)/gim, '');
+  // Closed-loop pacing feedback (see onContext_WTG): the model may echo it.
+  cleaned = cleaned.replace(/^\s*Last pacing:.*(?:\n|$)/gim, '');
 
   // Remove internal tags and explicit system command leakage.
   cleaned = cleaned.replace(/<scratchpad>[\s\S]*?<\/scratchpad>/gi, '');
@@ -3338,7 +4002,6 @@ function onInput_WTG(text) {
   // Mark that the input hook ran this cycle: retry (which re-fires input)
   // must be distinguishable from a Continue generation (which does not) when
   // the context prune compares actionCounts.
-  state.wtgInputRanThisCycle = true;
 
   // Prioritize handling the dedicated [sleep] command as it completely replaces this input.
   const sleepCommandMatch = text.trim().match(/^\[sleep(?:\s+([^\]]+))?\]$/i);
@@ -3444,6 +4107,7 @@ function onInput_WTG(text) {
             // Persist "explicit settime executed" state so other hooks can coordinate.
             markSettimeAsInitialized();
             writeTurnData([]);
+            state.wtgSkipBackfill = true;
             clearDynamicMinuteRemainder();
             // The clock restarts at zero: thresholds from the old timeline are
             // all in the future now and must not freeze AI pacing.
@@ -3680,24 +4344,94 @@ function onInput_WTG(text) {
  *   subsequent timestamp cleanup.
  */
 function reconcileTurnLog() {
+  // A clock reset ([settime]) discards the log on purpose: the old history
+  // belongs to a timeline that no longer applies, so it must not be re-seeded.
+  const skipBackfill = Boolean(state.wtgSkipBackfill);
+  delete state.wtgSkipBackfill;
+
   let turnData = getTurnData();
   let historyRolledBack = false;
   let rollbackTurnTime = null;
+  let changeType = 'new';
+  delete state.wtgRetryAmbiguous;
 
   // --- Rewind / Retry Recovery, primary path -------------------------------
   // info.actionCount is the host's authoritative position signal: it drops on
   // rewind and stays put on retry. Compare it against the logged record counts
   // and prune the discarded tail. Fast, and immune to narrative-text reuse.
-  // The input-ran flag is consumed immediately: if this turn's generation
-  // later fails, a stale flag must not turn a future Continue into a fake
-  // retry.
-  const inputRanThisCycle = Boolean(state.wtgInputRanThisCycle);
-  delete state.wtgInputRanThisCycle;
-  if (pruneTurnDataByActionCount(turnData, inputRanThisCycle)) {
-    turnData = getTurnData();
-    rollbackTurnTime = getLastTimestampFromWTGData();
+  const pruned = pruneTurnDataByActionCount(turnData);
+  turnData = pruned.records;
+  if (pruned.changed) {
+    rollbackTurnTime = getLastTimestampFromWTGData(turnData);
     historyRolledBack = true;
+    changeType = pruned.retry ? 'retry' : 'rewind';
   }
+
+  // A retry chain belongs to one action: anything left over from a turn that
+  // never wrote its record must not attach to a later one. The pending count is
+  // the action being regenerated, which is the host count itself.
+  const pendingCount = state.wtgPendingRetries ? state.wtgPendingRetries.count : null;
+  const currentCount = hostActionCount();
+  if (pendingCount !== null && pendingCount !== currentCount) {
+    delete state.wtgPendingRetries;
+  }
+
+  // --- Redo recovery -------------------------------------------------------
+  // The host position jumped past the log's end, so the player redid actions
+  // this log no longer holds. Restore the saved branch that matches what the
+  // host kept: its timestamps, pacing trail and open frame come back with it.
+  // A restored branch is positive evidence, so it also lifts the unverified
+  // freeze that a deep rewind may have set.
+  let restoredFrameJson = null;
+  const committedCount = committedCountOf(info);
+  if (committedCount !== null && committedCount > 0) {
+    const maxLoggedCount = turnData.reduce((acc, record) => (
+      record.actionCount !== null && record.actionCount > acc ? record.actionCount : acc
+    ), -1);
+    const restored = committedCount > maxLoggedCount + 1
+      ? restoreAltBranch(turnData, committedCount)
+      : {records: turnData, restored: 0};
+    turnData = restored.records;
+    if (restored.restored > 0) {
+      rollbackTurnTime = getLastTimestampFromWTGData(turnData);
+      historyRolledBack = true;
+      changeType = 'redo';
+      delete state.wtgClockUnverified;
+      delete state.wtgClockUnverifiedReason;
+      const lastRestored = turnData[turnData.length - 1];
+      restoredFrameJson = lastRestored && lastRestored.frame ? lastRestored.frame : null;
+    }
+  }
+
+  // --- Anchor seeding ------------------------------------------------------
+  // Only when nothing better exists: a restored branch is exact, interpolation
+  // is a guess. Covers a mid-adventure install and a log whose front was
+  // evicted by the record cap.
+  if (!skipBackfill) {
+    turnData = backfillTurnLogFromHistory(turnData, history).records;
+  }
+
+  // --- Retry resolution ----------------------------------------------------
+  // Flipping between retried responses runs no hook, so the attempt the player
+  // kept is only visible here, by text, on the record's own chain. When it is
+  // not the record's response, the clock and the open frame follow the kept
+  // attempt instead.
+  const keptRetry = resolveKeptRetry(turnData[turnData.length - 1], history);
+  if (keptRetry) {
+    const keptTT = parseTurnTime(keptRetry.timestamp);
+    if (keptTT) {
+      rollbackTurnTime = keptTT;
+      historyRolledBack = true;
+      changeType = 'retry';
+      restoredFrameJson = keptRetry.frame || null;
+    }
+  }
+
+  // --- Text refresh --------------------------------------------------------
+  // The host's history is the source of truth for what was actually said. When
+  // an entry no longer matches the record at its position (the player edited
+  // it), the record takes the host's text so later branch matching still works.
+  turnData = freshenTurnLog(turnData, history);
 
   // --- Rewind / Retry Recovery, text-match fallback ------------------------
   // Covers legacy v3 records (no actionCount) and host environments without a
@@ -3721,14 +4455,13 @@ function reconcileTurnLog() {
     if (lastRewindAnchorIndex >= 0) {
       const matchingTurn = findLatestTurnDataEntryInHistory(turnData, history);
       if (!matchingTurn) {
-        writeTurnData(turnData.slice(0, firstRewindAnchorIndex));
-        turnData = getTurnData();
-        rollbackTurnTime = getLastTimestampFromWTGData();
+        turnData = turnData.slice(0, firstRewindAnchorIndex);
+        writeTurnData(turnData);
+        rollbackTurnTime = getLastTimestampFromWTGData(turnData);
         historyRolledBack = true;
       } else if (matchingTurn.index !== lastRewindAnchorIndex) {
-        trimTurnDataAfterIndex(turnData, matchingTurn.index);
-        turnData = getTurnData();
-        rollbackTurnTime = getLastTimestampFromWTGData();
+        turnData = trimTurnDataAfterIndex(turnData, matchingTurn.index);
+        rollbackTurnTime = getLastTimestampFromWTGData(turnData);
         historyRolledBack = true;
       }
     }
@@ -3747,7 +4480,20 @@ function reconcileTurnLog() {
       // No anchor and no marker survived: the rewind landed before the whole
       // tracked span. Freeze destructive cleanup until evidence re-establishes
       // the clock; card stamps and narrative dates become the recovery source.
+      // The reason is recorded so the freeze is diagnosable rather than a
+      // silent state a player can get stuck in.
       state.wtgClockUnverified = true;
+      state.wtgClockUnverifiedReason = 'rewind-past-tracking';
+    }
+  }
+
+  // A restored branch or a kept retry variant carries the open scene frame with
+  // it. Apply it after the rollback block above, which clears the frame.
+  if (restoredFrameJson) {
+    try {
+      state.wtgOpenTimeFrame = JSON.parse(restoredFrameJson);
+    } catch (error) {
+      delete state.wtgOpenTimeFrame;
     }
   }
 
@@ -3799,6 +4545,13 @@ function reconcileTurnLog() {
   // card, so recoverUnverifiedClock re-reads only when a prune/trim happened.
   recoverUnverifiedClock(turnData);
 
+  // What kind of turn this is, resolved once and kept for the debug card (and
+  // for any logic that must treat a retry differently from a fresh action).
+  if (turnData.length === 0 && hostHistory().length === 0) {
+    changeType = 'start';
+  }
+  state.wtgChangeType = changeType;
+
   return turnData;
 }
 
@@ -3833,24 +4586,25 @@ function onContext_WTG(text) {
   // After erase/reset processing, remove future timestamps from non-system storycards.
   cleanupStoryCardsByTimestamp(state.currentDate, state.currentTime);
   updateWTGDebugCard();
-  // Pacing permission is cooldown-aware (WTG 3.0 parity): a command on
-  // cooldown is not advertised, so the AI never wastes attempts on pacing
-  // that would be silently suppressed. Opening turns hide it entirely —
-  // time has not started moving and the opening text needs no pacing. The
-  // prohibitions stay unconditional.
+  // Closed-loop feedback: the previous turn's pacing outcome rides along with
+  // the clock, so the model sees what its command actually did (applied,
+  // clamped, or suppressed) instead of re-deriving the clock from scratch.
+  // The last record IS the previous turn by construction; a record left in the
+  // erased future by a rewind is dropped by the timestamp check, so a stale
+  // branch never speaks for the current one.
+  const lastRecord = turnData.length > 0 ? turnData[turnData.length - 1] : null;
+  const lastRecordTT = lastRecord ? parseTurnTime(lastRecord.timestamp) : null;
+  const lastRecordFresh = Boolean(lastRecordTT && compareTurnTime(lastRecordTT, state.turnTime) <= 0);
+  const pacingNote = lastRecordFresh && lastRecord.pacing ? `\nLast pacing: ${lastRecord.pacing}` : '';
+
+  // On-demand pacing hint: gated by relevance (what this beat implies) and by
+  // availability (never name a command that cannot run). Silence is the
+  // default - a standing menu invites use, a conditional sentence does not.
+  // Opening turns stay silent entirely: the opening establishes the scene.
   let instructions = '';
   if (areAITimeCommandsEnabled() && !isOpeningTimeGuardActive()) {
-    const sleepReady = !isSleepCooldownActive();
-    const advanceReady = !isAdvanceCooldownActive();
-    if (sleepReady && advanceReady) {
-      instructions += ` You may control pacing by writing (sleep) or (advance 30 minutes); when the story jumps ahead - days go by, a journey ends - use larger skips like (advance 3 days). Actions like travelling, waiting, or searching imply time on their own even without a stated duration - give them a fitting (advance ...), e.g. (advance 20 minutes) for a short trip. Pacing commands always sit on their own line, never woven into a sentence; they have short in-game cooldowns and are removed from the story automatically.`;
-    } else if (sleepReady) {
-      instructions += ` You may control pacing by writing (sleep). Pacing commands have short in-game cooldowns and are removed from the story automatically.`;
-    } else if (advanceReady) {
-      instructions += ` You may control pacing by writing (advance 30 minutes), or larger skips like (advance 3 days) when the story jumps ahead. Actions like travelling, waiting, or searching imply time on their own even without a stated duration - give them a fitting (advance ...), e.g. (advance 20 minutes) for a short trip. Pacing commands always sit on their own line, never woven into a sentence; they have short in-game cooldowns and are removed from the story automatically.`;
-    } else {
-      instructions += ` Scene pacing is resting for now - narrate normally.`;
-    }
+    const pacingCue = classifyPacingCue(state.wtgPendingPlayerInputRaw || state.wtgPendingPlayerInputText || '');
+    instructions += buildPacingHint(pacingCue, !isSleepCooldownActive(), Boolean(state.wtgPacingEverUsed));
   }
   instructions += `\nDo not write player commands in [square brackets], do not expose system metadata, and only mention exact time when the narrative naturally requires it. Keep scene chronology consistent with the hidden current date/time below.`;
 
@@ -3860,12 +4614,18 @@ function onContext_WTG(text) {
   let dateTimeInjection = '';
   if (hasSettimeBeenInitialized() && state.currentTime !== 'Unknown') {
     const timeBucket = isPreciseTime(state.currentTime) ? ` (${getDescriptiveBucketFromPreciseTime(state.currentTime)})` : '';
+    const textMinutes = lastRecordFresh && Number(lastRecord.estimate) > 0
+      ? Number(lastRecord.estimate)
+      : 0;
+    // What the text alone bought this turn. Paired with "Last pacing" above it
+    // is the contrast that teaches the model when a command is worth writing.
+    const textSuffix = textMinutes > 0 ? `, +${textMinutes} min from text` : '';
     const weekday = getDayOfWeek(state.currentDate);
     const weekdayPrefix = weekday ? `${weekday}, ` : '';
-    dateTimeInjection = `\nCurrent date: ${weekdayPrefix}${state.currentDate}; Current time: ${state.currentTime}${timeBucket}`;
+    dateTimeInjection = `\nCurrent date: ${weekdayPrefix}${state.currentDate}; Current time: ${state.currentTime}${timeBucket}${textSuffix}`;
   }
 
-  return modifiedText + dateTimeInjection;
+  return modifiedText + pacingNote + dateTimeInjection;
 }
 
 /**
@@ -3878,6 +4638,11 @@ function onContext_WTG(text) {
 function onOutput_WTG(text) {
   // Ensure state.turnTime is always initialized
   state.turnTime = state.turnTime || {years:0, months:0, days:0, hours:0, minutes:0, seconds:0};
+
+  // Text-derived minutes for THIS turn, recorded with the turn so the next
+  // context can show what the text alone bought (the command counterpart is
+  // the "Last pacing" line). Stays 0 on turns a command advanced.
+  let turnEstimateMinutes = 0;
 
   let modifiedText = text;
 
@@ -3927,6 +4692,7 @@ function onOutput_WTG(text) {
             // Since this is auto-detected [settime], mark as initialized here
             markSettimeAsInitialized();
             writeTurnData([]);
+            state.wtgSkipBackfill = true;
 
             // Initialize required system storycards
             updateDateTimeCard();
@@ -3960,6 +4726,20 @@ function onOutput_WTG(text) {
   actionType = getHostActionType(actionType);
   const pendingPlayerInput = hasPendingPlayerInput();
   const freshPendingPlayerInput = hasFreshPendingPlayerInput();
+  // The type this turn is timed as: the pending player action's own type when
+  // there is one, otherwise a Continue. Shared by the estimator and by the
+  // recollection test below, so both read the turn the same way.
+  const timingActionType = pendingPlayerInput
+    ? (state.wtgPendingPlayerInputType || actionType || 'do')
+    : 'continue';
+  // Recollection turns get two treatments: the estimator runs them at a tenth
+  // rate, and AI pacing commands are stripped without executing. Both read the
+  // same input (the player's own words) through the same test, so the two can
+  // never disagree about whether this turn is a memory.
+  const recollectionText = pendingPlayerInput
+    ? String(state.wtgPendingPlayerInputRaw || state.wtgPendingPlayerInputText || '')
+    : '';
+  const isRecollectionTurn = hasPastSpeechMemoryContext(recollectionText, timingActionType);
   const ttMatch = modifiedText.match(/\[\[(-?\d+y\d+m\d+d\d+h\d+n\d+s)\]\]\s*$/);
   let parsedTT = ttMatch ? parseTurnTime(ttMatch[1]) : null;
   let narrative = ttMatch
@@ -3981,7 +4761,7 @@ function onOutput_WTG(text) {
   // own wording ("(advance 2 hours)", "Two hours later") would otherwise be
   // counted a second time by the explicit-duration extractor.
   const preStripNarrative = modifiedText;
-  const aiCommandResult = executeAITimeCommands(modifiedText);
+  const aiCommandResult = executeAITimeCommands(modifiedText, isRecollectionTurn);
   modifiedText = stripAITimeCommands(modifiedText, aiCommandResult.removable);
   // The estimate below must read the POST-strip text (see its comment above):
   // even when the safety net below restores the command wording for display,
@@ -4005,9 +4785,6 @@ function onOutput_WTG(text) {
   delete state.wtgSleepArcFresh;
 
   const skipAutomaticTiming = Boolean(state.wtgSkipNextAutomaticTiming);
-  const timingActionType = pendingPlayerInput
-    ? (state.wtgPendingPlayerInputType || actionType || 'do')
-    : 'continue';
   // An executed AI pacing command is this turn's authoritative time jump. The
   // post-strip narrative echoes the commanded duration in prose ("Half an
   // hour later", "slept through the night"), and the explicit-duration
@@ -4058,6 +4835,10 @@ function onOutput_WTG(text) {
       state.wtgSimilarity = similarity;
       state.wtgLastDynamicEstimate = estimate;
     }
+    // Closed-loop contrast: the clock line reports what the text alone bought.
+    // Paired with "Last pacing:" (what a command bought), this is the only
+    // signal that teaches the model when a command is worth writing.
+    turnEstimateMinutes = estimate.minutes;
     state.wtgPendingPlayerInputNeedsTiming = false;
 
     if (estimate.minutes > 0) {
@@ -4114,6 +4895,10 @@ function onOutput_WTG(text) {
         continue;
       }
 
+      // Self-heal: collapse any pre-existing duplicate stamp pile (5+ digit
+      // year clocks defeated the old 4-digit guard) before re-stamping logic.
+      collapseDuplicateCardStamps(card);
+
       if (card.entry && !hasTimestamp(card) && isCardKeywordMentioned(card, combinedText)) {
         addTimestampToCard(card, `${state.currentDate} ${state.currentTime}`);
       }
@@ -4134,7 +4919,11 @@ function onOutput_WTG(text) {
     // addTurnData replaces the stale same-actionCount record on retry (input
     // re-fired) and appends normally otherwise; Continue generations never
     // replace the player-action record they share a count with.
-    addTurnData(persistedActionType, persistedActionText, persistedResponse, timestamp, {pacing: (aiCommandResult.applied || []).join('; ')});
+    addTurnData(persistedActionType, persistedActionText, persistedResponse, timestamp, {
+      pacing: (aiCommandResult.notes || []).join('; '),
+      estimate: turnEstimateMinutes,
+      frame: state.wtgOpenTimeFrame ? JSON.stringify(state.wtgOpenTimeFrame) : ''
+    });
   }
 
   if (pendingPlayerInput) {

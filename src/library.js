@@ -13,6 +13,16 @@ const WTG_SCENE_START_DATE = '04/04/2026'; // Or change it as needed
 const WTG_DEFAULT_TEXT_CHARS_PER_TURN = 600;
 const WTG_DEFAULT_TURNS_PER_HOUR = 30;
 const WTG_MAX_OPENING_ACTIONS = 2;
+// Settings that are hidden unless a flag is on. The card shows only the
+// everyday knobs; these technical ones appear under a group header when their
+// flag is true. Values live in state.wtgSettingStore so hiding a line never
+// loses what the player set. Adding a new hidden setting is one entry here
+// plus a getGatedSetting() read - no per-setting state key, no render code.
+const WTG_GATED_SETTINGS = [
+  {id: 'charsPerTurn', name: 'Text Characters per Turn', flag: 'Debug Mode', fallback: WTG_DEFAULT_TEXT_CHARS_PER_TURN},
+  {id: 'turnsPerHour', name: 'Number of Turns per Hour', flag: 'Debug Mode', fallback: WTG_DEFAULT_TURNS_PER_HOUR}
+];
+const WTG_GATED_GROUP_TITLE = '=== Debug setting ===';
 // AI-issued time commands are gated so the AI can participate in time
 // management without spamming the clock. Sleep is gated by in-game time (you
 // cannot sleep again eight hours after waking); advance is gated per response
@@ -386,13 +396,11 @@ function getSceneStartDate() {
 }
 
 /**
- * Fresh start date for the opening clock. Re-rolls when a Starting Daterange
- * is configured (mirroring the random-time re-roll on opening retries); for a
- * fixed Starting Date or no config, returns the stable value identical to
- * getSceneStartDate(). Callers that assign the opening clock (and that need
- * the identity to track a real player action) must ALSO pin the result to
- * state.wtgSceneStartDate so getSceneStartDate() stays consistent with the
- * assigned startingDate.
+ * Fresh start date for the opening clock: re-rolls when a Starting Daterange is
+ * configured (mirroring the time re-roll on opening retries), otherwise returns
+ * the stable getSceneStartDate() value. Callers assigning the opening clock
+ * must also pin the result to state.wtgSceneStartDate, so getSceneStartDate()
+ * stays consistent with the assigned startingDate.
  * @returns {string} mm/dd/yyyy scene start date
  */
 function rollSceneStartDate() {
@@ -818,13 +826,7 @@ function getSleepDuration(currentTime) {
   };
 }
 
-/**
- * Validates whether a date is valid
- * @param {number} month - Month (1-12)
- * @param {number} day - Day (1-31)
- * @param {number} year - Year
- * @returns {boolean} True if the date is valid
- */
+/** True when the month/day/year triple is a real calendar date. */
 function isValidDate(month, day, year) {
   const date = new Date(year, month - 1, day);
   return date.getFullYear() === year && (date.getMonth() + 1) === month && date.getDate() === day;
@@ -1145,12 +1147,10 @@ function compareTurnTime(tt1, tt2) {
 }
 
 /**
- * Reduces a turn time to a single comparable number via the real calendar.
- * Note: ms-based Date comparison inherits local-time DST quirks (worst case
- * ~1h, twice a year, possibly an ordering collision inside a spring-forward
- * gap). The core advance math (computeCurrent/advanceDateTimeValue) is
- * integer/calendar-based and immune; only this comparison and getDateDiff's
- * remainder are exposed — an accepted approximation for a narrative clock.
+ * Reduces a turn time to one comparable number via the real calendar. Inherits
+ * local-time DST quirks (up to ~1h twice a year, possibly an ordering collision
+ * inside a spring-forward gap); the advance math itself is integer/calendar
+ * based and immune. Accepted approximation for a story clock.
  */
 function getComparableTurnTimeValue(tt) {
   if (typeof state === 'undefined' || !state || !state.startingDate || !state.startingTime || !parseClockTime(state.startingTime)) {
@@ -1228,7 +1228,7 @@ function normalizeTurnDataRecord(record) {
     // True when responseText was head-truncated at the storage cap: matching
     // then uses prefix semantics (see storedResponseMatchesHistory).
     truncated: Boolean(record && record.truncated),
-    // Pacing audit trail (P19): every recognized AI command on this turn with
+    // Pacing audit trail: every recognized AI command on this turn with
     // its outcome - "command -> +N min" when applied, "(clamped to frame)" when
     // the scene frame shortened it, "skipped (reason)" when suppressed.
     // Post-strip responses hide executed commands, so the log carries them
@@ -1251,12 +1251,10 @@ function normalizeTurnDataRecord(record) {
 }
 
 /**
- * Trims stored text to the cap so the WTG Data card stays bounded.
- * Truncation keeps the head of the text; the truncation flag rides along on
- * the record so matching can use prefix semantics regardless of how the
- * stored text normalizes (see storedResponseMatchesHistory).
- * @param {string} text - Raw text
- * @returns {{text: string, truncated: boolean}} Bounded text and truncation flag
+ * Caps stored text so the WTG Data card stays bounded. Keeps the head and
+ * returns the truncation flag, which lets matching use prefix semantics
+ * regardless of how the stored text normalizes (see
+ * storedResponseMatchesHistory).
  */
 function boundStoredText(text) {
   const raw = String(text || '');
@@ -1265,18 +1263,15 @@ function boundStoredText(text) {
 }
 
 /**
- * Compares a stored response against a history text. Records at or under the
- * storage cap match by equality; truncated records match when the history
- * text starts with the stored prefix — the store keeps the head of the
- * response, and a same-length equality is impossible for any genuinely
- * longer history entry. The truncation gate tests the RAW stored length
- * (what boundStoredText capped); both sides are normalized here, and a
- * whitespace-heavy truncated record normalizes shorter than the cap while
- * still needing prefix semantics.
- * @param {string} storedText - Normalized stored response text
- * @param {boolean} storedWasTruncated - True when the raw stored text hit the cap
- * @param {string} historyText - Normalized history entry text
- * @returns {boolean} True when the texts refer to the same output
+ * Compares a stored response against a history text. Untruncated records match
+ * by equality; truncated ones match by prefix, because the store keeps only
+ * the head of the response. The truncation flag reflects the RAW stored
+ * length: both sides are normalized here, so a whitespace-heavy record can
+ * normalize shorter than the cap and still need prefix semantics.
+ * @param {string} storedText - Normalized stored response
+ * @param {boolean} storedWasTruncated - True when the raw text hit the cap
+ * @param {string} historyText - Normalized history entry
+ * @returns {boolean} True when they refer to the same output
  */
 function storedResponseMatchesHistory(storedText, storedWasTruncated, historyText) {
   if (!storedText || !historyText) return false;
@@ -1339,10 +1334,8 @@ function parseLegacyTurnData(entry) {
  * @returns {Array} Array of turn data objects
  */
 /**
- * Authoritative turn-log storage (P15/P19 organization): state.wtgLog is a
- * structured array - the single home of the record objects. On first access
- * the legacy card-hosted log (JSON blocks / legacy text) is migrated once;
- * after that the WTG Data card serves only as a human-readable view.
+ * Authoritative turn-log storage: state.wtgLog is the single home of the
+ * records; the WTG Data card is only a rendered view of it.
  * @returns {Array} The live record array (newest last)
  */
 function getTurnData() {
@@ -1655,7 +1648,7 @@ function hasFreshPendingPlayerInput() {
 }
 
 /**
- * Sleep-arc ledger (P15): a sleep declaration in the player's action text
+ * Sleep-arc ledger: a sleep declaration in the player's action text
  * opens a time frame {kind, durationMinutes, targetDeltaMinutes, baseMinutes};
  * the arc resolves when the story narrates waking (output hook). Magnitude
  * ("sleep for two hours") and target ("until tomorrow afternoon") are both
@@ -1676,7 +1669,7 @@ function trackSleepArcDeclaration(text) {
     return;
   }
 
-  // Say/do vetting for the declaration itself (P18): "Want to sleep for two
+  // Say/do vetting for the declaration itself: "Want to sleep for two
   // hours" is a desire, not a commitment - it does not open a frame. Each
   // sleep-verb occurrence is sentence-window vetted against the shared
   // exclusion list; the first committed occurrence opens the frame, and
@@ -2573,7 +2566,7 @@ function isWTGInternalCard(card) {
   if (!card || !card.title) return false;
   return card.title === "WTG Data"
     || card.title === "Current Date and Time"
-    || card.title === "World Time Generator Settings"
+    || card.title === "WTG Settings"
     || card.title === "WTG Debug"
     || card.title === "WTG Cooldowns"
     || card.title === WTG_SCENE_CONFIG_CARD_TITLE;
@@ -2783,16 +2776,14 @@ function calculateKeywordSimilarity(keywords1, keywords2) {
  * @returns {Object} WTG Settings storycard object
  */
 function getWTGSettingsCard() {
-  let settingsCard = storyCards.find(card => card.title === "World Time Generator Settings");
+  let settingsCard = storyCards.find(card => card.title === "WTG Settings");
   if (!settingsCard) {
-    addStoryCard("World Time Generator Settings");
+    addStoryCard("WTG Settings");
     settingsCard = storyCards[storyCards.length - 1];
     settingsCard.type = "System";
     settingsCard.keys = ""; // No keys to avoid entering AI context
-    settingsCard.description = "World Time Generator Settings - Edit the values below to configure the system.";
+    settingsCard.description = "WTG Settings - Edit the values below to configure the system.";
     settingsCard.entry = `Time Duration Multiplier: 1.0
-Text Characters per Turn: ${WTG_DEFAULT_TEXT_CHARS_PER_TURN}
-Number of Turns per Hour: ${WTG_DEFAULT_TURNS_PER_HOUR}
 AI Time Commands: true
 Debug Mode: false
 WTG Disabled: false`;
@@ -2801,7 +2792,115 @@ WTG Disabled: false`;
     settingsCard.keys = "";
     migrateWTGSettings(settingsCard);
   }
+  syncGatedSettings(settingsCard);
   return settingsCard;
+}
+
+/**
+ * Reads a boolean flag straight out of an entry, bypassing
+ * getWTGBooleanSetting() — that would recurse back into getWTGSettingsCard().
+ * @returns {boolean} The flag, false when absent
+ */
+function readFlagFromEntry(entry, flagName) {
+  const match = String(entry || '').match(
+    new RegExp(`^\\s*${escapeRegexLiteral(flagName)}:\\s*(true|false)\\s*$`, 'im')
+  );
+  return match ? match[1].toLowerCase() === 'true' : false;
+}
+
+/**
+ * Reads a numeric line from a settings-card entry.
+ * @param {string} entry - Settings card entry text
+ * @param {string} name - Setting name to read
+ * @returns {number|null} The value, or null when the line is absent/unparsable
+ */
+function readNumberLine(entry, name) {
+  const match = String(entry || '').match(
+    new RegExp(`^\\s*${escapeRegexLiteral(name)}:\\s*((?:\\d+(?:\\.\\d*)?)|(?:\\.\\d+))\\s*$`, 'im')
+  );
+  if (!match) return null;
+  const value = parseFloat(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Removes every gated setting line and the group header from an entry.
+ * @param {string} entry - Settings card entry text
+ * @returns {string} Entry without the gated section
+ */
+function stripGatedSection(entry) {
+  let out = String(entry || '');
+  for (const spec of WTG_GATED_SETTINGS) {
+    out = out.replace(
+      new RegExp(`^\\s*${escapeRegexLiteral(spec.name)}:[^\\n]*(?:\\n|$)`, 'gim'), ''
+    );
+  }
+  out = out.replace(new RegExp(`^\\s*${escapeRegexLiteral(WTG_GATED_GROUP_TITLE)}\\s*(?:\\n|$)`, 'gim'), '');
+  return out.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
+ * Keeps gated settings in sync with their flag.
+ *
+ * Reads happen every call (cheap): any gated line present in the entry has its
+ * value copied into state.wtgSettingStore, so editing it under Debug Mode
+ * takes effect immediately. Writes happen only when the visible set actually
+ * changed - flipping the flag, or a line being present when it should not be.
+ * An unchanged card is never rewritten.
+ * @param {Object} settingsCard - The settings storycard
+ */
+function syncGatedSettings(settingsCard) {
+  if (!settingsCard) return;
+  const entry = String(settingsCard.entry || '');
+  const store = state.wtgSettingStore || (state.wtgSettingStore = {});
+
+  const rows = WTG_GATED_SETTINGS.map(spec => {
+    const value = readNumberLine(entry, spec.name);
+    if (value !== null) store[spec.id] = value;
+    return {spec, visible: readFlagFromEntry(entry, spec.flag), present: value !== null};
+  });
+
+  const signature = rows.map(row => (row.visible ? '1' : '0')).join('');
+  const outOfSync = rows.some(row => row.visible !== row.present);
+  if (state.wtgGatedSignature === signature && !outOfSync) return;
+  state.wtgGatedSignature = signature;
+
+  const visibleSpecs = rows.filter(row => row.visible).map(row => row.spec);
+  let next = stripGatedSection(entry);
+  if (visibleSpecs.length > 0) {
+    const lines = visibleSpecs.map(spec => {
+      const value = Number.isFinite(Number(store[spec.id])) ? store[spec.id] : spec.fallback;
+      return `${spec.name}: ${value}`;
+    });
+    next = `${next}\n\n${WTG_GATED_GROUP_TITLE}\n${lines.join('\n')}`;
+  }
+  settingsCard.entry = next;
+}
+
+/**
+ * Reads a gated setting by id, falling back to its declared default.
+ * @param {string} id - Setting id from WTG_GATED_SETTINGS
+ * @returns {number} The configured value, or the fallback
+ */
+function getGatedSetting(id) {
+  const spec = WTG_GATED_SETTINGS.find(entry => entry.id === id);
+  if (!spec) return 0;
+  const store = state.wtgSettingStore || {};
+  const value = Number(store[id]);
+  return Number.isFinite(value) && value > 0 ? value : spec.fallback;
+}
+
+/**
+ * Adds a boolean setting line when the entry has no parsable one yet, keeping
+ * the legacy value when migrating an old name.
+ * @returns {string} Entry with the line present
+ */
+function ensureBooleanLine(entry, name, value) {
+  if (new RegExp(`^\\s*${escapeRegexLiteral(name)}:\\s*(true|false)\\s*$`, 'im').test(entry)) {
+    return entry;
+  }
+  const body = String(entry || '').trim();
+  return body ? `${body}\n${name}: ${value}` : `${name}: ${value}`;
 }
 
 function migrateWTGSettings(settingsCard) {
@@ -2809,28 +2908,12 @@ function migrateWTGSettings(settingsCard) {
   settingsCard.entry = settingsCard.entry || '';
 
   const legacyDisableMatch = settingsCard.entry.match(/^\s*(?:Disable WTG Entirely|Disable WTG):\s*(true|false)\s*$/im);
-  const hasCurrentDisable = /^\s*WTG Disabled:\s*(true|false)\s*$/im.test(settingsCard.entry);
-  if (!hasCurrentDisable) {
-    const value = legacyDisableMatch ? legacyDisableMatch[1].toLowerCase() : 'false';
-    settingsCard.entry = settingsCard.entry.trim()
-      ? `${settingsCard.entry.trim()}\nWTG Disabled: ${value}`
-      : `WTG Disabled: ${value}`;
-  }
-  if (!/^\s*AI Time Commands:\s*(true|false)\s*$/im.test(settingsCard.entry)) {
-    settingsCard.entry = settingsCard.entry.trim()
-      ? `${settingsCard.entry.trim()}\nAI Time Commands: true`
-      : `AI Time Commands: true`;
-  }
-  if (!/^\s*Text Characters per Turn:\s*\d+(?:\.\d+)?\s*$/im.test(settingsCard.entry)) {
-    settingsCard.entry = settingsCard.entry.trim()
-      ? `${settingsCard.entry.trim()}\nText Characters per Turn: ${WTG_DEFAULT_TEXT_CHARS_PER_TURN}`
-      : `Text Characters per Turn: ${WTG_DEFAULT_TEXT_CHARS_PER_TURN}`;
-  }
-  if (!/^\s*Number of Turns per Hour:\s*\d+(?:\.\d+)?\s*$/im.test(settingsCard.entry)) {
-    settingsCard.entry = settingsCard.entry.trim()
-      ? `${settingsCard.entry.trim()}\nNumber of Turns per Hour: ${WTG_DEFAULT_TURNS_PER_HOUR}`
-      : `Number of Turns per Hour: ${WTG_DEFAULT_TURNS_PER_HOUR}`;
-  }
+  settingsCard.entry = ensureBooleanLine(
+    settingsCard.entry,
+    'WTG Disabled',
+    legacyDisableMatch ? legacyDisableMatch[1].toLowerCase() : 'false'
+  );
+  settingsCard.entry = ensureBooleanLine(settingsCard.entry, 'AI Time Commands', 'true');
 
   settingsCard.entry = settingsCard.entry
     .replace(/^\s*Disable WTG Entirely:\s*(?:true|false)\s*$/gim, '')
@@ -2847,11 +2930,7 @@ function migrateWTGSettings(settingsCard) {
  */
 function getWTGBooleanSetting(settingName) {
   const settingsCard = getWTGSettingsCard();
-  if (!settingsCard || !settingsCard.entry) return false;
-
-  const regex = new RegExp(`${settingName}:\\s*(true|false)`, 'i');
-  const match = settingsCard.entry.match(regex);
-  return match ? match[1].toLowerCase() === 'true' : false;
+  return readFlagFromEntry(settingsCard && settingsCard.entry, settingName);
 }
 
 function isWTGDisabled() {
@@ -2867,16 +2946,11 @@ function areAITimeCommandsEnabled() {
 }
 
 /**
- * Returns true while the story is in its opening turn(s): the clock has just
- * been established and no real baseline exists yet. Opening text loves to
- * narrate nights passing and mornings arriving, and the AI loves to fire
- * (sleep) right away — both would jump the clock hours before the scene
- * actually settles. During the opening window:
- *   - AI time commands are suppressed (recognized, stripped, not executed);
- *   - automatic time estimation is skipped entirely: the opening text
- *     establishes the scene, time has not started moving yet.
- * The window is the first player action (actionCount <= 1, same condition as
- * the storycard auto-[settime] scan) while no turn time has accumulated.
+ * True while the story is in its opening turn: the clock is established but no
+ * time has accumulated. Opening text loves narrating nights and mornings, and
+ * the AI loves firing (sleep) immediately, so during this window AI commands
+ * are suppressed and automatic estimation is skipped. Ends as soon as the
+ * first player action accumulates time.
  * @returns {boolean}
  */
 function isOpeningTimeGuardActive() {
@@ -2893,35 +2967,19 @@ function isOpeningTimeGuardActive() {
  */
 function getTimeMultiplier() {
   const settingsCard = getWTGSettingsCard();
-  if (!settingsCard || !settingsCard.entry) return 1.0;
-
-  const regex = /^\s*Time Duration Multiplier:\s*((?:\d+(?:\.\d*)?)|(?:\.\d+))\s*$/im;
-  const match = settingsCard.entry.match(regex);
-  if (match) {
-    const value = parseFloat(match[1]);
-    return Number.isFinite(value) && value > 0 ? value : 1.0;
-  }
-  return 1.0;
+  const value = readNumberLine(settingsCard && settingsCard.entry, 'Time Duration Multiplier');
+  return value !== null && value > 0 ? value : 1.0;
 }
 
 /**
- * Derives characters-per-minute from the Text Characters per Turn and
- * Number of Turns per Hour settings — the same two-knob calibration model as
- * WTG 3.0 (600 chars × 30 turns/hour → 300 chars per in-game minute).
- * @returns {number} Story characters per in-game minute of dynamic time
+ * Characters per in-game minute, from the two gated calibration settings (the
+ * WTG 3.0 model: 600 chars × 30 turns/hour → 300). Both knobs are hidden
+ * unless Debug Mode is on; their values live in state.
+ * @returns {number}
  */
 function getCharsPerMinute() {
-  const defaultCPM = (WTG_DEFAULT_TEXT_CHARS_PER_TURN * WTG_DEFAULT_TURNS_PER_HOUR) / 60;
-  const settingsCard = getWTGSettingsCard();
-  if (!settingsCard || !settingsCard.entry) return defaultCPM;
-
-  const numberPattern = '((?:\\d+(?:\\.\\d*)?)|(?:\\.\\d+))';
-  const charsMatch = settingsCard.entry.match(new RegExp(`^\\s*Text Characters per Turn:\\s*${numberPattern}\\s*$`, 'im'));
-  const turnsMatch = settingsCard.entry.match(new RegExp(`^\\s*Number of Turns per Hour:\\s*${numberPattern}\\s*$`, 'im'));
-  const chars = charsMatch ? parseFloat(charsMatch[1]) : WTG_DEFAULT_TEXT_CHARS_PER_TURN;
-  const turns = turnsMatch ? parseFloat(turnsMatch[1]) : WTG_DEFAULT_TURNS_PER_HOUR;
-  if (!Number.isFinite(chars) || chars <= 0 || !Number.isFinite(turns) || turns <= 0) return defaultCPM;
-  return (chars * turns) / 60;
+  getWTGSettingsCard(); // refresh state.wtgSettingStore from the card first
+  return (getGatedSetting('charsPerTurn') * getGatedSetting('turnsPerHour')) / 60;
 }
 
 function getDynamicMinuteRemainder() {
@@ -3155,7 +3213,7 @@ const WTG_TIME_FLOORS = {
   'the following day': 1440
 };
 const WTG_TIME_FLOOR_SOURCE = Object.keys(WTG_TIME_FLOORS).map(escapeRegexLiteral).join('|');
-// Open time-frame classes (P15 general form): each kind declares the verb
+// Open time-frame classes: each kind declares the verb
 // vocabulary that opens (player announcement) and closes (narrated
 // completion) its arc. The ledger and the completion detectors are
 // kind-agnostic; adding a new arc kind is a table row, not new plumbing.
@@ -3208,7 +3266,7 @@ function extractExplicitDurationMinutes(turnText) {
   const lower = normalizeActionText(turnText).toLowerCase();
   if (!lower) return 0;
 
-  // Say/do gating, part 1 (P13): anything inside double-quoted spans is
+  // Say/do gating: anything inside double-quoted spans is
   // character speech - words, never deeds. "You say, 'I sleep until tomorrow
   // afternoon'" announces a plan; it does not walk the clock there.
   // Duration matches and floor phrases inside quotes are skipped wholesale.
@@ -3287,7 +3345,7 @@ function extractExplicitDurationMinutes(turnText) {
     transitionMinutes = Math.max(transitionMinutes, floorValue);
   }
 
-  // P14: wake-arrival floors. The canonical sleep-skip completion is a
+  // Wake-arrival floors. The canonical sleep-skip completion is a
   // waking narration ("You wake the next afternoon."); the verb is
   // load-bearing here - "in the evening" alone describes a state, while
   // "You wake in the evening." is an arrival. Arrival computes to the
@@ -3509,12 +3567,9 @@ function ensureLeadingSpace(actionText) {
 // cooldowns, and always stripped from the visible narrative.
 
 /**
- * Resolves an arrival point to a forward-only delta from the current clock.
- * A target equal to the current minute lands on the next occurrence, matching
- * the phase semantics of the sleep-arc detector.
- * @param {number} nowMinutes - Current clock in minutes past midnight
- * @param {number} targetMinutes - Arrival point in minutes past midnight
- * @param {boolean} dayQualified - True when the argument said tomorrow/next/following
+ * Resolves an arrival point to a forward-only delta. A target equal to the
+ * current minute lands on the next occurrence, matching the sleep-arc
+ * detector's phase semantics.
  * @returns {number} Positive minutes to add
  */
 function resolveTargetDeltaMinutes(nowMinutes, targetMinutes, dayQualified) {
@@ -3576,10 +3631,9 @@ function parseAITargetSpec(raw) {
 }
 
 /**
- * Parses the argument tail of an AI advance command. Accepts either a relative
- * duration (" 2 hours", "1 month 2 days", reusing parseAdvanceSpec so AI and
- * player share one grammar) or a target (" until evening", " to 6:00 AM").
- * @param {string} argText - Raw argument tail inside the parentheses
+ * Parses an AI command's argument tail: a relative duration ("2 hours",
+ * "1 month 2 days") through parseAdvanceSpec, or a target ("until evening",
+ * "to 6:00 AM"). AI and player share one grammar.
  * @returns {Object} {add, summary} on success, {error} on failure
  */
 function parseAIAdvanceArgs(argText) {
@@ -3591,10 +3645,8 @@ function parseAIAdvanceArgs(argText) {
 }
 
 /**
- * True when parseAIAdvanceArgs produced a usable, non-zero duration object.
- * Shared by the executor and the well-formedness probe so both treat the
- * same inputs as prose.
- * @param {Object} parsed - Result of parseAIAdvanceArgs
+ * True when parseAIAdvanceArgs produced a usable, non-zero duration. Shared by
+ * the executor and the well-formedness probe so both call the same input prose.
  * @returns {boolean}
  */
 function isUsableAdvanceAdd(parsed) {
@@ -3624,11 +3676,8 @@ function findAITimeCommands(text) {
 }
 
 /**
- * Records a suppressed command: counted, stripped from the narrative, and
- * reported in the outcome notes the next turn's context replays.
- * @param {Object} result - Executor accumulator
- * @param {Object} cmd - Command from findAITimeCommands
- * @param {string} reason - Short reason, shown to the model verbatim
+ * Records a suppressed command: counted, stripped, and reported in the notes
+ * the next turn replays.
  */
 function skipCommand(result, cmd, reason) {
   result.skipped++;
@@ -3637,11 +3686,8 @@ function skipCommand(result, cmd, reason) {
 }
 
 /**
- * Records an executed command with the minutes it actually moved the clock.
- * @param {Object} result - Executor accumulator
- * @param {Object} cmd - Command from findAITimeCommands
- * @param {number} minutes - Minutes applied
- * @param {boolean} clamped - True when the open scene frame shortened it
+ * Records an executed command and the minutes it actually moved, noting when an
+ * open scene frame shortened it.
  */
 function applyCommand(result, cmd, minutes, clamped) {
   result.executed++;
@@ -3700,7 +3746,7 @@ function executeAITimeCommands(text, suppressForRecollection = false) {
     return result;
   }
 
-  // P17: frame-scoped pacing authority. While an open time-frame with a
+  // Frame-scoped pacing authority. While an open time-frame with a
   // declared magnitude/target is live, each AI command is clamped to the
   // remaining budget - the story declared how long this arc lasts, and the
   // model's improvisation stops there. An exhausted frame suppresses further
@@ -3828,12 +3874,10 @@ function executeAITimeCommands(text, suppressForRecollection = false) {
 }
 
 /**
- * Checks whether an AI command's arguments are well-formed time-command
- * syntax. Used to distinguish recognizable pacing commands (strip from the
- * narrative even when suppressed) from parenthesized prose (keep). Must stay
- * consistent with the executor's prose rules via isUsableAdvanceAdd.
- * @param {Object} cmd - Command from findAITimeCommands
- * @returns {boolean} True when the command syntax is valid
+ * True when the command's arguments are well-formed pacing syntax. Separates
+ * recognizable commands (stripped even when suppressed) from parenthesized
+ * prose (kept); shares isUsableAdvanceAdd with the executor so both agree.
+ * @returns {boolean}
  */
 function isWellFormedAICommand(cmd) {
   // Bare (sleep) is always well-formed.
@@ -3905,10 +3949,8 @@ function buildPacingHint(cue, sleepReady, everUsed) {
 }
 
 /**
- * Removes specific AI time commands from the visible narrative. Only the
- * commands the executor recognized (executed or suppressed) are removed;
- * prose lookalikes survive.
- * @param {string} text - Output text possibly containing (sleep)/(advance ...)
+ * Removes the commands the executor recognized (executed or suppressed) from
+ * the visible narrative; prose lookalikes survive.
  * @param {string[]} removable - Exact command texts to strip
  * @returns {string} Cleaned text
  */
@@ -4775,7 +4817,7 @@ function onOutput_WTG(text) {
     modifiedText = preStripNarrative;
   }
 
-  // Sleep-arc ledger (P15) + frame authority (P17): the arc resolves when
+  // Sleep-arc ledger + frame authority: the arc resolves when
   // the story narrates waking; AI commands during the arc are clamped to the
   // declared budget instead of superseding it; a fresh announcement
   // suppresses this turn's estimate (a plan is not passage).
